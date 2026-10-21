@@ -33,6 +33,9 @@ jobs:
           node scripts/check-imports.js
           node scripts/check-encoding.cjs
 
+      - name: Secret scan
+        run: node scripts/scan-secrets.mjs
+
       - name: Start the server
         run: |
           node server/index.js > server.log 2>&1 &

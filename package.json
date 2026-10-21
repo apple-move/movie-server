@@ -21,6 +21,7 @@
     "test:playback": "node scripts/test-playback.js",
     "test:remux": "node scripts/test-remux.js",
     "test:reset": "node scripts/reset-library.js",
+    "scan:secrets": "node scripts/scan-secrets.mjs",
     "lint:encoding": "node scripts/check-encoding.cjs"
   },
   "dependencies": {
