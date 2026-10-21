@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+  <meta name="theme-color" content="#08080c">
+  <meta name="color-scheme" content="dark light">
+  <meta name="description" content="Your personal movie library — stream and download from any cloud storage.">
+  <title>Movie Server</title>
+  <link rel="preconnect" href="https://image.tmdb.org" crossorigin>
+  <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%23ff2d55'/%3E%3Cpath d='M12 9v14l11-7-11-7z' fill='%23fff'/%3E%3C/svg%3E">
+  <link rel="stylesheet" href="/css/styles.css">
+  <link rel="stylesheet" href="/css/player.css">
+  <!-- Applies the saved theme before the first paint (an external file, so
+       the strict Content-Security-Policy needs no inline-script allowance). -->
+  <script src="/js/theme-boot.js"></script>
+</head>
+<body>
+  <div id="app" class="app">
+    <header class="topbar" id="topbar">
+      <div class="topbar__left">
+        <a class="brand" href="#/" data-link title="Movie Server">
+          <span class="brand__mark" id="brand-mark"></span>
+          <span class="brand__text">MovieServer</span>
+        </a>
+        <nav class="nav" id="nav" aria-label="Main">
+          <a href="#/" data-link data-nav="home"><span>Home</span></a>
+          <a href="#/library" data-link data-nav="library"><span>Library</span></a>
+          <a href="#/continue" data-link data-nav="continue"><span>Continue</span></a>
+          <a href="#/admin" data-link data-nav="admin" class="nav__admin"><span>Admin</span></a>
+        </nav>
+      </div>
+
+      <div class="topbar__right">
+        <form class="search" id="search-form" role="search">
+          <span class="search__icon" id="search-icon"></span>
+          <input type="search" id="search-input" placeholder="Search movies…" autocomplete="off" aria-label="Search movies">
+        </form>
+        <div class="userbox" id="userbox"></div>
+        <button class="icon-btn" id="theme-toggle" title="Toggle theme" aria-label="Toggle theme"></button>
+      </div>
+    </header>
+
+    <main id="view" class="view" tabindex="-1"></main>
+
+    <footer class="footer">
+      <span>Movie Server</span>
+      <span class="footer__dot">•</span>
+      <span id="footer-stats">Loading…</span>
+    </footer>
+  </div>
+
+  <div class="modal-root" id="modal-root" hidden></div>
+  <div class="toast-stack" id="toast-stack" aria-live="polite"></div>
+
+  <script type="module" src="/js/app.js"></script>
+</body>
+</html>
