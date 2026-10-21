@@ -1,0 +1,82 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          # Node 24 has node:sqlite enabled by default.
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Static checks
+        run: |
+          node scripts/check-imports.js
+          node scripts/check-encoding.cjs
+
+      - name: Start the server
+        run: |
+          node server/index.js > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3000/api/health > /dev/null; then
+              echo "server is up"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          echo "server did not start:"
+          cat server.log
+          exit 1
+
+      - name: Create the test admin
+        run: |
+          node --input-type=module -e "
+            import bcrypt from 'bcryptjs';
+            import { DatabaseSync } from 'node:sqlite';
+            const db = new DatabaseSync('./data/movie-server.db');
+            const hash = bcrypt.hashSync('admin123', 12);
+            const existing = db.prepare(\"SELECT id FROM users WHERE username = 'admin'\").get();
+            if (existing) {
+              db.prepare(\"UPDATE users SET password_hash = ?, role = 'admin' WHERE username = 'admin'\").run(hash);
+            } else {
+              db.prepare(\"INSERT INTO users (username, password_hash, role) VALUES ('admin', ?, 'admin')\").run(hash);
+            }
+            db.close();
+            console.log('admin ready');
+          "
+
+      - name: API tests
+        run: node scripts/test-api.js
+
+      - name: Security tests
+        run: node scripts/test-security.js
+
+      - name: TMDB tests
+        run: node scripts/test-tmdb.js
+
+      - name: Archive / HLS tests
+        run: node scripts/test-archive-hls.js
+
+      - name: Stop the server
+        if: always()
+        run: kill $(cat server.pid) 2>/dev/null || true

@@ -1,5 +1,18 @@
-import { DatabaseSync } from 'node:sqlite';
 import { config } from './config.js';
+
+// node:sqlite is built in from Node 22.5 (behind --experimental-sqlite on
+// 22.x) and enabled by default from Node 23.4 onwards.
+let DatabaseSync;
+try {
+  ({ DatabaseSync } = await import('node:sqlite'));
+} catch {
+  console.error(
+    '\n[db] node:sqlite is not available in this Node.js build.\n' +
+      '  Node 22.5 or newer is required. On Node 22.x, start the server with:\n' +
+      '    node --experimental-sqlite server/index.js\n',
+  );
+  process.exit(1);
+}
 
 export const db = new DatabaseSync(config.dbPath);
 
