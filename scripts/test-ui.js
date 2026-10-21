@@ -213,6 +213,14 @@ async function main() {
   check('modal shows title', (await page.locator('.modal__title').innerText()).includes('Matrix'));
   check('modal lists sources', (await page.locator('.source-item').count()) > 0);
   check('modal has download button', await page.locator('.modal a.btn:has-text("Download")').first().isVisible());
+
+  // The modal must be opaque — the library must not show through it.
+  await page.waitForTimeout(400);
+  const modalBg = await page.locator('.modal').evaluate(
+    (el) => getComputedStyle(el).backgroundColor,
+  );
+  check('the modal is opaque', !/rgba\([^)]*,\s*0?\.\d+\)/.test(modalBg), modalBg);
+
   await page.screenshot({ path: path.join(SHOTS, '04-detail.png') });
 
   await page.keyboard.press('Escape');
