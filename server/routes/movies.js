@@ -1,9 +1,16 @@
 ﻿import { Router } from 'express';
+import { createHash } from 'node:crypto';
 import { one, q, run } from '../db.js';
 import { requireAuth, requireAdmin } from '../lib/auth.js';
-import { listProviders, getProvider } from '../providers/index.js';
+import {
+  listProviders,
+  getProvider,
+  getInstanceRow,
+  reloadInstance as reloadProviderInstance,
+} from '../providers/index.js';
 import { humanSize, isVideoName, isSubtitleName, isArchiveName, isPlaylistName, mimeFromName } from '../lib/mime.js';
 import { listZipEntries, pickVideoEntry } from '../lib/zip.js';
+import { validateUrl, safeFetch, fileNameFromUrl } from '../lib/safe-url.js';
 
 export const moviesRouter = Router();
 
@@ -211,6 +218,8 @@ moviesRouter.patch('/:id', requireAuth, requireAdmin, (req, res) => {
     imdb_id: 'imdb_id',
     trailer_url: 'trailer_url',
     release_date: 'release_date',
+    skip_intro: 'skip_intro',
+    skip_credits: 'skip_credits',
   };
 
   for (const [key, column] of Object.entries(map)) {
@@ -221,7 +230,7 @@ moviesRouter.patch('/:id', requireAuth, requireAdmin, (req, res) => {
         ? String(body[key]).trim()
         : ['year', 'runtime', 'tmdb_id', 'vote_count'].includes(column)
           ? toIntOrNull(body[key])
-          : ['rating'].includes(column)
+          : ['rating', 'skip_intro', 'skip_credits'].includes(column)
             ? toNumberOrNull(body[key])
             : body[key],
     );
@@ -365,6 +374,124 @@ moviesRouter.post('/:id/sources', requireAuth, requireAdmin, async (req, res) =>
     remotePath,
   );
   res.status(201).json({ source, movedFrom });
+});
+
+/**
+ * POST /api/movies/:id/sources/url
+ *
+ * Add a source from a URL instead of a file:
+ *   - a direct video URL  → streamed straight through the server
+ *   - a .zip URL          → the archive contents can be picked in the player
+ *
+ * The URL is validated against SSRF before it is ever fetched.
+ */
+moviesRouter.post('/:id/sources/url', requireAuth, requireAdmin, async (req, res) => {
+  const movie = getMovie(Number(req.params.id));
+  if (!movie) return res.status(404).json({ error: 'Movie not found' });
+
+  const raw = String(req.body?.url || '').trim();
+  if (!raw) return res.status(400).json({ error: 'A URL is required' });
+
+  let validated;
+  try {
+    validated = await validateUrl(raw);
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  const fileName = fileNameFromUrl(validated.url.toString());
+  const isArchive = /\.(zip)$/i.test(fileName) || isArchiveName(fileName);
+  const kind = isArchive ? 'zip' : 'file';
+
+  // Register a one-off provider instance for this URL. The id is a full
+  // hash, so two different URLs never collide.
+  const instanceId = `url_${createHash('sha256').update(validated.url.toString()).digest('hex').slice(0, 24)}`;
+  const existing = getInstanceRow(instanceId);
+  if (existing) {
+    // Refresh the stored URL — it may have changed (or the id may be from an
+    // earlier configuration).
+    run(
+      'UPDATE provider_instances SET config = ?, name = ? WHERE id = ?',
+      JSON.stringify({ url: validated.url.toString(), name: fileName }),
+      fileName,
+      instanceId,
+    );
+    // The cached provider still holds the old URL.
+    reloadProviderInstance(instanceId);
+  } else {
+    run(
+      `INSERT INTO provider_instances (id, type, name, config, enabled, is_default)
+       VALUES (?,?,?,?,1,0)`,
+      instanceId,
+      isArchive ? 'url-archive' : 'url',
+      fileName,
+      JSON.stringify({ url: validated.url.toString(), name: fileName }),
+    );
+  }
+
+  let size = 0;
+  let mime = mimeFromName(fileName);
+  try {
+    const provider = getProvider(instanceId);
+    await provider.init();
+    // Find out how big the file is, and whether it really is a video.
+    const head = await safeFetch(validated.url.toString(), {
+      method: 'HEAD',
+    });
+    const length = Number(head.headers.get('content-length') || 0);
+    const type = head.headers.get('content-type') || '';
+    if (length > 0) size = length;
+    if (type && !mimeFromName(fileName).includes('octet-stream')) mime = type;
+  } catch (err) {
+    console.error('[movies] URL probe failed:', err.message);
+    // A failed HEAD is not fatal — the file may still stream.
+  }
+
+  let container = null;
+  if (isArchive) {
+    container = 'zip';
+    try {
+      const provider = getProvider(instanceId);
+      const entries = await listZipEntries(provider, validated.url.toString());
+      const video = pickVideoEntry(entries);
+      if (!video) {
+        return res.status(400).json({ error: 'That archive contains no playable video' });
+      }
+      size = video.size;
+      mime = mimeFromName(video.name);
+    } catch (err) {
+      console.error('[movies] archive read failed:', err.message);
+      return res.status(400).json({ error: 'That archive could not be read' });
+    }
+  }
+
+  try {
+    run(
+      `INSERT INTO sources (movie_id, provider, remote_path, file_name, size, mime, quality, label, kind, container)
+       VALUES (?,?,?,?,?,?,?,?,?,?)
+       ON CONFLICT(provider, remote_path) DO UPDATE SET
+         movie_id = excluded.movie_id, size = excluded.size, mime = excluded.mime, kind = excluded.kind`,
+      movie.id,
+      instanceId,
+      validated.url.toString(),
+      fileName,
+      size,
+      mime,
+      req.body?.quality ?? null,
+      req.body?.label ?? fileName,
+      kind,
+      container,
+    );
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  const source = one(
+    'SELECT * FROM sources WHERE provider = ? AND remote_path = ?',
+    instanceId,
+    validated.url.toString(),
+  );
+  res.status(201).json({ source });
 });
 
 /**

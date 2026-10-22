@@ -30,10 +30,13 @@ export function createMegaProvider(instance = {}) {
 
     async init() {
       if (!provider.isConfigured()) return;
+      // autologin is disabled so the login promise is ours to handle — the
+      // library's own promise would be unhandled and crash the process.
       provider.storage = new Storage({
         email: cfg.email,
         password: cfg.password,
         userAgent: 'MovieServer/1.0',
+        autologin: false,
       });
       await provider.storage.login();
     },

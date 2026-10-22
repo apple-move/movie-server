@@ -24,9 +24,12 @@ churn, no native compilation — it just runs.
 | | |
 |---|---|
 | ⚡ **True streaming** | Real HTTP Range requests — a 4K file starts playing instantly and seeking is instant |
+| 🎚️ **Quality control** | Pick the resolution (Original / 1080p / 720p / 480p / 360p / 240p) and the audio bitrate — the file is converted on the fly by ffmpeg while you watch, and the current quality is shown in the top bar |
 | 🎛️ **Master player** | Speed, frame stepping, A–B loop, PiP, aspect ratio, picture filters, volume boost to 200 %, snapshots, live stats |
 | 💬 **Subtitles** | Auto-detected, styled, with a sync offset, converted from SRT to WebVTT on the fly |
 | 🔖 **Bookmarks & chapters** | Save positions, jump between chapters, resume exactly where you stopped |
+| ⏭️ **Next / previous episode** | A movie holding several episodes moves between them; otherwise between movies |
+| ⏱️ **Sleep timer** | Pause automatically after 5–60 minutes |
 | ⬇️ **Downloads** | One click, original filename preserved |
 
 ### Management
@@ -193,6 +196,30 @@ instances as you like from **Admin → Storage → + Add provider**:
 Each instance gets its own id (`r2_backup`, `mega_2`, …). The scanner, the
 uploader and the file browser all let you pick which instance to use, and the
 Admin panel shows the disk usage of each one separately.
+
+---
+
+## 🔗 Adding a movie by URL
+
+Any HTTP(S) URL works — you do not have to upload the file first.
+
+**Admin → Movies → URL**, then paste the link:
+
+| The URL points to | What happens |
+|---|---|
+| A video file (`.mp4`, `.mkv`, …) | It is streamed straight through the server, with full seeking support |
+| A `.zip` archive | The contents are listed and you pick the file inside the player |
+
+Only admins can add a URL, and the URL is checked before it is fetched:
+
+- `http` and `https` only
+- no credentials in the URL
+- **private and reserved addresses are refused** — loopback, `10.x`, `172.16.x`,
+  `192.168.x`, `169.254.x` (cloud metadata), `100.64.x`, IPv6 loopback and
+  unique-local, `0.0.0.0`
+- every redirect hop is re-checked
+- a URL that resolves to a private address can only be used when
+  `ALLOW_PRIVATE_URLS=true` is set (useful for a NAS on your own LAN)
 
 ---
 
@@ -485,10 +512,13 @@ All endpoints live under `/api`. Authenticate with `Authorization: Bearer <token
 ```bash
 npm test              # import check + API suite
 npm run test:api      # API suite (98 assertions)
-npm run test:archive  # ZIP + HLS + multi-provider + malformed archives (75)
-npm run test:security # security regressions (24)
+npm run test:archive  # ZIP + HLS + multi-provider + malformed archives (81)
+npm run test:security # security regressions + SSRF (35)
 npm run test:tmdb     # TMDB key + full-import fields (15)
-npm run test:ui       # browser UI suite (79, real Chrome)
+npm run test:url      # add-by-URL: video, ZIP, SSRF (22)
+npm run test:quality  # on-the-fly quality control (32)
+npm run test:ui       # browser UI suite (80, real Chrome)
+npm run test:player   # every player option, in a real browser
 ```
 
 `test:ui` drives a real browser through login → browse → detail → player →

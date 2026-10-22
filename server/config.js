@@ -134,6 +134,13 @@ export const config = {
   // through the normal streaming route (ffmpeg needs a seekable input).
   // Generated automatically when not set, so jobs work out of the box.
   jobToken: str(process.env.JOB_TOKEN, ''),
+
+  // Full path to the ffmpeg/ffprobe binaries, when they are not on PATH.
+  ffmpegPath: str(process.env.FFMPEG_PATH, ''),
+
+  // Allow "add by URL" to reach private addresses (a NAS on the LAN, a local
+  // media server). Off by default, because it removes the SSRF protection.
+  allowPrivateUrls: bool(process.env.ALLOW_PRIVATE_URLS, false),
 };
 
 export const isProd = config.env === 'production';

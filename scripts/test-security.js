@@ -257,6 +257,32 @@ async function main() {
     String(withSession.res.status),
   );
 
+  /* ------------------------------------------- SSRF: private addresses */
+  section('10. SSRF protection for URL imports');
+  const movie = await req('POST', '/api/movies', {
+    token, body: { title: 'SSRF Test', year: 2024 },
+  });
+  const movieId = movie.json?.movie?.id;
+
+  for (const [label, url] of [
+    ['loopback', 'http://127.0.0.1:3000/api/health'],
+    ['loopback alias', 'http://127.1.2.3/secret'],
+    ['localhost', 'http://localhost:3000/'],
+    ['private 10.x', 'http://10.0.0.5/movie.mp4'],
+    ['private 172.16.x', 'http://172.16.0.5/movie.mp4'],
+    ['private 192.168.x', 'http://192.168.1.10/movie.mp4'],
+    ['link-local metadata', 'http://169.254.169.254/latest/meta-data/'],
+    ['carrier-grade NAT', 'http://100.64.0.1/movie.mp4'],
+    ['0.0.0.0', 'http://0.0.0.0/movie.mp4'],
+    ['IPv6 loopback', 'http://[::1]:3000/'],
+    ['IPv6 unique local', 'http://[fd00::1]/movie.mp4'],
+  ]) {
+    const attempt = await req('POST', `/api/movies/${movieId}/sources/url`, { token, body: { url } });
+    check(`${label} is refused`, attempt.res.status === 400, `${attempt.res.status} ${attempt.text?.slice(0, 80)}`);
+  }
+
+  await req('DELETE', `/api/movies/${movieId}`, { token });
+
   /* ------------------------------------- cleanup --------------------- */
   await req('DELETE', `/api/movies/${hlsMovieId}`, { token });
   await req('DELETE', `/api/movies/${evilMovie.json?.movie?.id}`, { token });

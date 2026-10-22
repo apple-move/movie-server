@@ -177,6 +177,7 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
   const timeLabel = el('span', { class: 'mp__time' }, '0:00 / 0:00');
   const volumeInput = el('input', { type: 'range', min: '0', max: '1', step: '0.01', value: '1' });
   const subBtn = btn('subtitles', 'Subtitles (C)', () => openMenu('subtitles'));
+  const qualityBtn = btn('sliders', 'Video quality (Q)', () => openMenu('quality'));
   const statsBtn = btn('chart', 'Statistics (I)', () => toggleStats());
   const loopBtn = btn('rotateCcw', 'A–B loop (L)', () => toggleLoop());
   const bookmarkBtn = btn('bookmark', 'Bookmark (B)', () => addBookmark());
@@ -201,13 +202,20 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
 
   const topTitle = el('strong', {}, movie.title);
   const topSub = el('span', {}, '');
+  const qualityBadge = el('span', { class: 'mp__quality' }, 'Original');
 
   const topBar = el(
     'div',
     { class: 'mp__top' },
     el('button', { class: 'mp__back', title: 'Back (Esc)', onClick: () => leave() }, icon('chevronLeft', { size: 20 })),
     el('div', { class: 'mp__title' }, topTitle, topSub),
-    el('div', { class: 'mp__top-actions' }, castTopBtn, statsBtn, theatreBtn, helpBtn),
+    el('div', { class: 'mp__top-actions' },
+      qualityBadge,
+      castTopBtn,
+      statsBtn,
+      theatreBtn,
+      helpBtn,
+    ),
   );
 
   const bottomBar = el(
@@ -227,6 +235,7 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
       speedBtn,
       el('div', { class: 'mp__volume' }, muteBtn, volumeInput),
       subBtn,
+      qualityBtn,
       loopBtn,
       bookmarkBtn,
       pipBtn,
@@ -290,6 +299,86 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     flash.classList.add('is-visible');
   }
 
+  /** Pin the HLS level to the quality the viewer chose. */
+  function applyQualityLevel() {
+    if (!hlsInstance) return;
+    if (qualityKey === 'auto' || qualityKey === 'direct') {
+      hlsInstance.currentLevel = -1; // automatic
+      currentQualityLabel = 'Auto';
+    } else {
+      const index = hlsLevels.findIndex((l) => qualityKeyForLevel(l) === qualityKey);
+      hlsInstance.currentLevel = index >= 0 ? index : -1;
+      currentQualityLabel = index >= 0 ? `${hlsLevels[index].height}p` : 'Auto';
+    }
+    updateQualityBadge();
+  }
+
+  /** Map an hls.js level back to our quality key. */
+  function qualityKeyForLevel(level) {
+    const height = level.height || 0;
+    if (renditions.length) {
+      const match = renditions.find((r) => r.height === height);
+      if (match) return match.key;
+    }
+    if (height >= 2160) return '2160p';
+    if (height >= 1080) return '1080p';
+    if (height >= 720) return '720p';
+    if (height >= 480) return '480p';
+    if (height >= 360) return '360p';
+    return '240p';
+  }
+
+  /**
+   * Switch the quality.
+   *
+   * 'direct' plays the original file untouched. Any other key switches to
+   * the transcoded HLS stream, where the quality becomes a selectable level.
+   */
+  function setQuality(key) {
+    const wasTime = video.currentTime;
+    const wasPlaying = !video.paused && !video.ended;
+
+    if (key === 'direct' || key === 'auto') {
+      qualityMode = 'direct';
+      qualityKey = key;
+      currentQualityLabel = key === 'auto' ? 'Auto' : 'Original';
+    } else {
+      qualityMode = 'hls';
+      qualityKey = key;
+      currentQualityLabel = key.replace('p', 'p');
+    }
+
+    loadSource(false);
+    video.addEventListener(
+      'loadedmetadata',
+      () => {
+        if (wasTime > 0 && wasTime < (video.duration || 0)) video.currentTime = wasTime;
+        if (wasPlaying) video.play()?.catch(() => {});
+        applyQualityLevel();
+      },
+      { once: true },
+    );
+    updateQualityBadge();
+    showToast(`Quality: ${qualityLabelFor(key)}`);
+  }
+
+  function qualityLabelFor(key) {
+    if (key === 'direct') return 'Original (no conversion)';
+    if (key === 'auto') return 'Auto';
+    const match = renditions.find((r) => r.key === key);
+    return match?.label || key;
+  }
+
+  /** Update the little quality badge in the top bar. */
+  function updateQualityBadge() {
+    if (!qualityBadge) return;
+    const label = qualityMode === 'direct'
+      ? (currentQualityLabel || 'Original')
+      : (currentQualityLabel || 'Auto');
+    qualityBadge.textContent = label;
+    qualityBadge.hidden = !label;
+  }
+
   /* ------------------------------------------------------ source load */
   function destroyHls() {
     if (hlsInstance) {
@@ -309,6 +398,39 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
   }
 
   /**
+   * How the video is being delivered.
+   *
+   *   'direct' — the file is streamed as-is (fastest, original quality)
+   *   'hls'    — the file is transcoded on the fly into HLS so the viewer
+   *              can pick a different quality
+   */
+  let qualityMode = 'direct';
+  let qualityKey = 'direct';
+  let audioKey = 'source';
+  let renditions = [];
+  let hlsLevels = [];
+  let mediaInfo = null;
+  let currentQualityLabel = '';
+  /** The real resolution of the file, once the browser has loaded it. */
+  const sourceResolution = { width: 0, height: 0, codec: '' };
+
+  /** The HLS master playlist for the current source. */
+  function masterUrl() {
+    if (activeSource.kind === 'hls') {
+      return `/api/stream/${activeSource.id}/hls`;
+    }
+    // Pass the resolution the browser already knows, so the server does not
+    // have to probe a possibly remote file.
+    const params = new URLSearchParams({ a: audioKey });
+    if (sourceResolution.width && sourceResolution.height) {
+      params.set('w', String(sourceResolution.width));
+      params.set('h', String(sourceResolution.height));
+      params.set('c', sourceResolution.codec || 'h264');
+    }
+    return `/api/stream/${activeSource.id}/master.m3u8?${params.toString()}`;
+  }
+
+  /**
    * Attach a source to the video element. HLS needs hls.js in Chrome and
    * Firefox; Safari plays it natively.
    */
@@ -316,21 +438,22 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     destroyHls();
     const url = sourceUrl();
 
-    if (activeSource.kind !== 'hls') {
+    if (qualityMode !== 'hls') {
       video.src = url;
       video.load();
       return;
     }
 
     if (video.canPlayType('application/vnd.apple.mpegurl') !== '') {
-      video.src = url;
+      // Safari handles HLS natively, including the quality levels.
+      video.src = masterUrl();
       video.load();
       return;
     }
 
     if (typeof window.Hls === 'undefined') {
-      showOverlay('cast', 'HLS not supported',
-        'This browser cannot play HLS streams and the player library could not be loaded.', true);
+      showOverlay('cast', 'Quality control unavailable',
+        'The HLS player library could not be loaded, so the quality selector is not available.', true);
       return;
     }
 
@@ -339,8 +462,19 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
       lowLatencyMode: false,
       backBufferLength: 60,
     });
-    hlsInstance.loadSource(url);
+    hlsInstance.loadSource(masterUrl());
     hlsInstance.attachMedia(video);
+    hlsInstance.on(window.Hls.Events.MANIFEST_PARSED, () => {
+      hlsLevels = hlsInstance.levels || [];
+      applyQualityLevel();
+    });
+    hlsInstance.on(window.Hls.Events.LEVEL_SWITCHED, (_event, data) => {
+      const level = hlsLevels[data.level];
+      if (level) {
+        currentQualityLabel = `${level.height}p`;
+        updateQualityBadge();
+      }
+    });
     hlsInstance.on(window.Hls.Events.ERROR, (_event, data) => {
       if (!data.fatal) return;
       if (data.type === window.Hls.ErrorTypes.NETWORK_ERROR) {
@@ -413,11 +547,14 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     }
   }
 
-  function setSpeed(value) {
+  function setSpeed(value, silent = false) {
     settings.speed = value;
     video.playbackRate = value;
     speedBtn.textContent = `${value}×`;
-    showToast(`Speed ${value}×`);
+    if (!silent) {
+      showToast(`Speed ${value}×`);
+      savePreferences();
+    }
   }
 
   function seekBy(delta) {
@@ -675,23 +812,6 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
       }
     }
 
-    if (info?.variants?.length) {
-      sourceMenu.append(el('div', { class: 'mp__menu-sep' }));
-      sourceMenu.append(menuSection('Quality'));
-      for (const variant of info.variants) {
-        sourceMenu.append(
-          menuButton(
-            variant.resolution || 'Variant',
-            variant.bandwidth ? `${Math.round(variant.bandwidth / 1000)} kbps` : '',
-            () => {
-              showToast('Switching quality…');
-              closeMenus();
-            },
-          ),
-        );
-      }
-    }
-
     sourceMenu.append(el('div', { class: 'mp__menu-sep' }));
     sourceMenu.append(
       menuButton('Download this file', '', () => {
@@ -704,6 +824,12 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     );
     sourceMenu.append(
       menuButton('Audio track', '', () => openMenu('audio-tracks')),
+    );
+    sourceMenu.append(
+      menuButton('Video quality', '', () => openMenu('quality')),
+    );
+    sourceMenu.append(
+      menuButton('Audio quality', '', () => openMenu('audio-quality')),
     );
 
     /* ------------------------------------------------------------ speed */
@@ -1028,12 +1154,199 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
       }
     }
 
+    /* --------------------------------------------------------- quality */
+    const qualityMenu = menu('quality');
+    qualityMenu.append(menuSection('Video quality'));
+
+    if (activeSource.kind === 'hls') {
+      // An HLS playlist carries its own variants.
+      const variants = info?.variants || [];
+      if (!variants.length) {
+        qualityMenu.append(el('div', { class: 'mp__menu-title' }, 'No variants in this playlist'));
+      }
+      qualityMenu.append(
+        menuButton('Auto', 'adaptive', () => {
+          setQuality('auto');
+          closeMenus();
+        }, qualityKey === 'auto'),
+      );
+      for (const variant of variants) {
+        const height = variant.resolution ? Number(String(variant.resolution).split('x')[1]) : 0;
+        const key = height ? qualityKeyForLevel({ height }) : 'auto';
+        qualityMenu.append(
+          menuButton(
+            variant.resolution || 'Variant',
+            variant.bandwidth ? `${Math.round(variant.bandwidth / 1000)} kbps` : '',
+            () => {
+              setQuality(key);
+              closeMenus();
+            },
+            qualityKey === key,
+          ),
+        );
+      }
+    } else {
+      // A plain file: the original, or a lower quality made on the fly.
+      qualityMenu.append(
+        menuButton('Original', 'no conversion', () => {
+          setQuality('direct');
+          closeMenus();
+        }, qualityMode === 'direct'),
+      );
+      if (!renditions.length) {
+        qualityMenu.append(el('div', { class: 'mp__menu-title' }, 'No other qualities available'));
+      }
+      for (const rendition of renditions) {
+        if (rendition.key === 'source') continue; // already offered as Original
+        qualityMenu.append(
+          menuButton(
+            rendition.label,
+            rendition.copy ? 'remux' : 'converted',
+            () => {
+              setQuality(rendition.key);
+              closeMenus();
+            },
+            qualityMode === 'hls' && qualityKey === rendition.key,
+          ),
+        );
+      }
+      if (renditions.length) {
+        qualityMenu.append(el('div', { class: 'mp__menu-sep' }));
+        qualityMenu.append(
+          menuButton('Auto', 'adaptive', () => {
+            setQuality('auto');
+            closeMenus();
+          }, qualityMode === 'hls' && qualityKey === 'auto'),
+        );
+      }
+    }
+
+    /* ----------------------------------------------------- audio quality */
+    const audioQualityMenu = menu('audio-quality');
+    audioQualityMenu.append(menuSection('Audio quality'));
+    const audioOptions = mediaInfo?.audio || [];
+    if (!audioOptions.length) {
+      audioQualityMenu.append(el('div', { class: 'mp__menu-title' }, 'No audio options'));
+    }
+    for (const option of audioOptions) {
+      audioQualityMenu.append(
+        menuButton(option.label, '', async () => {
+          audioKey = option.key;
+          // The audio setting only matters for the converted stream.
+          if (qualityMode === 'hls') {
+            const wasTime = video.currentTime;
+            const wasPlaying = !video.paused;
+            loadSource(false);
+            video.addEventListener('loadedmetadata', () => {
+              if (wasTime > 0 && wasTime < (video.duration || 0)) video.currentTime = wasTime;
+              if (wasPlaying) video.play()?.catch(() => {});
+            }, { once: true });
+          }
+          showToast(`Audio: ${option.label}`);
+          closeMenus();
+        }, audioKey === option.key),
+      );
+    }
+
     for (const m of [
       sourceMenu, speedMenu, subMenu, infoMenu, sleepMenu, audioTrackMenu,
+      qualityMenu, audioQualityMenu,
     ]) {
       stage.append(m);
     }
   }
+
+  /* --------------------------------------------------------- preferences */
+  /**
+   * Playback preferences are remembered per browser, so the speed, volume and
+   * subtitle style stay the way the viewer left them.
+   */
+  const PREF_KEY = 'ms_player_prefs';
+
+  function loadPreferences() {
+    try {
+      const raw = localStorage.getItem(PREF_KEY);
+      return raw ? JSON.parse(raw) : {};
+    } catch {
+      return {};
+    }
+  }
+
+  function savePreferences() {
+    try {
+      const prefs = loadPreferences();
+      prefs.speed = settings.speed;
+      prefs.volume = video.volume;
+      prefs.muted = video.muted;
+      prefs.subtitleStyle = settings.subtitleStyle?.name;
+      prefs.subtitleOffset = settings.subtitleOffset;
+      prefs.aspect = settings.aspect;
+      localStorage.setItem(PREF_KEY, JSON.stringify(prefs));
+    } catch { /* storage may be unavailable */ }
+  }
+
+  function applyPreferences() {
+    const prefs = loadPreferences();
+    if (prefs.speed && SPEEDS.includes(prefs.speed)) setSpeed(prefs.speed, true);
+    if (typeof prefs.volume === 'number') {
+      video.volume = Math.min(1, Math.max(0, prefs.volume));
+      volumeInput.value = String(video.volume);
+    }
+    if (typeof prefs.muted === 'boolean') video.muted = prefs.muted;
+    if (prefs.subtitleStyle) {
+      const style = SUBTITLE_STYLES.find((s) => s.name === prefs.subtitleStyle);
+      if (style) settings.subtitleStyle = style;
+    }
+    if (typeof prefs.subtitleOffset === 'number') {
+      settings.subtitleOffset = Math.min(10, Math.max(-10, prefs.subtitleOffset));
+    }
+    if (prefs.aspect) setAspect(prefs.aspect);
+  }
+
+  /* ---------------------------------------------------- skip intro/credits */
+  /**
+   * "Skip intro" and "skip credits" buttons, shown while the video is inside
+   * the configured window. The windows are stored per movie.
+   */
+  const skipIntro = el('button', { class: 'mp__skip', hidden: true }, 'Skip intro');
+  const skipCredits = el('button', { class: 'mp__skip', hidden: true }, 'Skip credits');
+  stage.append(skipIntro, skipCredits);
+
+  function updateSkipButtons() {
+    const time = video.currentTime || 0;
+    const duration = video.duration || 0;
+
+    const introEnd = Number(movie.skip_intro || 0);
+    const creditsStart = Number(movie.skip_credits || 0);
+
+    if (introEnd > 0 && time >= 0 && time < introEnd) {
+      skipIntro.hidden = false;
+      skipIntro.textContent = `Skip intro (${formatDuration(introEnd - time)})`;
+    } else {
+      skipIntro.hidden = true;
+    }
+
+    if (creditsStart > 0 && duration > 0 && time >= creditsStart && time < duration - 5) {
+      skipCredits.hidden = false;
+    } else {
+      skipCredits.hidden = true;
+    }
+  }
+
+  skipIntro.addEventListener('click', () => {
+    const target = Number(movie.skip_intro || 0);
+    if (target > 0) {
+      video.currentTime = target;
+      showToast('Skipped the intro');
+    }
+  });
+  skipCredits.addEventListener('click', () => {
+    const duration = video.duration || 0;
+    if (duration > 0) {
+      video.currentTime = duration - 30;
+      showToast('Skipped the credits');
+    }
+  });
 
   /* --------------------------------------------------------- extras */
   /**
@@ -1121,6 +1434,19 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
 
   /** Jump to the previous or next movie in the library. */
   async function goRelative(direction) {
+    // Episodes first: when a movie holds several episodes (S01E01, S01E02 …)
+    // the next/prev buttons move between them.
+    const episodes = sources.filter((s) => /s\d+e\d+/i.test(s.file_name || s.label || ''));
+    if (episodes.length > 1) {
+      const index = episodes.findIndex((s) => s.id === activeSource.id);
+      const next = episodes[index + direction];
+      if (next) {
+        switchSource(next);
+        showToast(next.file_name || next.label);
+        return;
+      }
+    }
+
     try {
       const list = await api.get('/api/movies?limit=500&sort=title');
       const movies = list.movies || [];
@@ -1291,6 +1617,11 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
 
     switch (e.key) {
       case 'Escape':
+        // In fullscreen, Escape only leaves fullscreen — the player stays.
+        if (document.fullscreenElement) {
+          document.exitFullscreen();
+          break;
+        }
         if (menuOpen) closeMenus();
         else if (!helpPanel.hidden) helpPanel.hidden = true;
         else leave();
@@ -1309,6 +1640,7 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
       case 'i': toggleStats(); break;
       case 's': takeSnapshot(); break;
       case 'c': openMenu('subtitles'); break;
+      case 'q': openMenu('quality'); break;
       case ',': stepFrame(-1); break;
       case '.': stepFrame(1); break;
       case '+': case '=': {
@@ -1346,6 +1678,7 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     ['Statistics', 'I'],
     ['Snapshot', 'S'],
     ['Subtitles', 'C'],
+    ['Video quality', 'Q'],
     ['Close', 'Esc'],
   ];
   for (const [label, keys] of shortcuts) {
@@ -1401,6 +1734,10 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
   stage.addEventListener('click', (e) => {
     if (e.target === video) togglePlay();
   });
+  // Double click toggles fullscreen, like a desktop player.
+  stage.addEventListener('dblclick', (e) => {
+    if (e.target === video || e.target === stage) toggleFullscreen();
+  });
 
   /* ------------------------------------------------------ video events */
   video.addEventListener('play', () => {
@@ -1419,15 +1756,24 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
   video.addEventListener('loadedmetadata', () => {
     renderChapterMarks();
     loadChapters();
-    // The resume position is applied once, on the first load. After a source
-    // switch the saved position must not override the current one.
-    if (!hasResumed) {
-      hasResumed = true;
-      if (progress && progress.position_sec > 10 &&
-          progress.position_sec < (video.duration || 0) - 30) {
-        video.currentTime = progress.position_sec;
-        showToast(`Resumed at ${formatDuration(progress.position_sec)}`);
+    // The browser knows the real resolution for free — remember it so the
+    // quality list can be built without probing the file.
+    if (video.videoWidth && video.videoHeight) {
+      const changed =
+        sourceResolution.width !== video.videoWidth ||
+        sourceResolution.height !== video.videoHeight;
+      sourceResolution.width = video.videoWidth;
+      sourceResolution.height = video.videoHeight;
+      if (changed && qualityMode === 'direct') {
+        currentQualityLabel = `${video.videoHeight}p`;
+        updateQualityBadge();
       }
+    }
+    if (!hasResumed && progress && progress.position_sec > 10 &&
+        progress.position_sec < (video.duration || 0) - 30) {
+      hasResumed = true;
+      video.currentTime = progress.position_sec;
+      showToast(`Resumed at ${formatDuration(progress.position_sec)}`);
     }
   });
   video.addEventListener('timeupdate', () => {
@@ -1447,6 +1793,8 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     if (settings.loopA !== null && settings.loopB !== null && current >= settings.loopB) {
       video.currentTime = settings.loopA;
     }
+
+    updateSkipButtons();
   });
   video.addEventListener('error', () => {
     const code = video.error?.code;
@@ -1535,10 +1883,10 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
   // hls.js is only fetched when an HLS stream is actually played.
   if (activeSource.kind === 'hls' && typeof window.Hls === 'undefined') {
     await loadHlsLibrary().catch(() => {});
-    if (myToken !== routeToken) {
-      leave();
-      return;
-    }
+  if (myToken !== routeToken) {
+    leave();
+    return;
+  }
   }
 
   // Bookmarks have to be loaded BEFORE the menus are built, otherwise the
@@ -1553,16 +1901,38 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
   buildSubtitleTracks();
   if (subtitles.length) setSubtitle(0);
   else setSubtitle(-1);
-  setSpeed(1);
-  setAspect('auto');
+  applyPreferences();
+  setAspect(settings.aspect);
   applySubtitleStyle();
+  updateQualityBadge();
 
   statsTimer = setInterval(updateStats, 500);
+
+  // Probe the file in the BACKGROUND — a remote file can be slow to probe,
+  // and the viewer should not wait for the quality list before watching.
+  loadMediaInfo();
 
   video.play()?.catch(() => {
     // Autoplay may be blocked; the user can press play.
   });
   wake();
+
+  /**
+   * Load the media details and rebuild the quality menu once they arrive.
+   */
+  async function loadMediaInfo() {
+    try {
+      const data = await api.get(`/api/stream/${activeSource.id}/media-info`);
+      if (myToken !== routeToken) return;
+      mediaInfo = data;
+      renditions = data?.renditions || [];
+      buildMenus();
+    } catch {
+      // The quality list stays empty; the original file still plays.
+      mediaInfo = null;
+      renditions = [];
+    }
+  }
 
   function leave() {
     releaseResources();

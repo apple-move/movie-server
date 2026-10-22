@@ -263,6 +263,13 @@ migrate('007-movie-metadata', () => {
   addColumnIfMissing('movies', 'vote_count', 'INTEGER');
 });
 
+migrate('008-skip-markers', () => {
+  // Where the intro ends and the credits begin, so the player can offer
+  // "skip intro" / "skip credits".
+  addColumnIfMissing('movies', 'skip_intro', 'REAL NOT NULL DEFAULT 0');
+  addColumnIfMissing('movies', 'skip_credits', 'REAL NOT NULL DEFAULT 0');
+});
+
 /** Small query helper: `q('select * from users where id = ?', id)` */
 export function q(sql, ...params) {
   return db.prepare(sql).all(...params);

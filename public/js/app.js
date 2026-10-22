@@ -171,7 +171,10 @@ async function onRoute() {
     closeModal();
     const id = Number(path.split('/')[2]);
     const params = new URLSearchParams(hash.split('?')[1] || '');
-    openPlayer(id, params).catch((err) => toast(err.message, 'error'));
+    openPlayer(id, params).catch((err) => {
+      console.error('[player] failed to open:', err);
+      toast(err.message || 'The player could not be opened', 'error');
+    });
     return;
   }
 

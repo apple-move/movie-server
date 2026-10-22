@@ -4,6 +4,7 @@ import { createR2Provider } from './r2.js';
 import { createGoogleDriveProvider } from './gdrive.js';
 import { createMegaProvider } from './mega.js';
 import { createTelegramProvider } from './telegram.js';
+import { createUrlProvider, createUrlArchiveProvider } from './url.js';
 import { config } from '../config.js';
 
 /**
@@ -21,6 +22,8 @@ const FACTORIES = {
   gdrive: createGoogleDriveProvider,
   mega: createMegaProvider,
   telegram: createTelegramProvider,
+  url: createUrlProvider,
+  'url-archive': createUrlArchiveProvider,
 };
 
 /** Live provider objects, keyed by instance id. */

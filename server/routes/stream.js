@@ -1,4 +1,7 @@
 import { Router } from 'express';
+import fs from 'node:fs';
+import fsp from 'node:fs/promises';
+import path from 'node:path';
 import { one, q } from '../db.js';
 import { requireAuth, requireAuthOrJob } from '../lib/auth.js';
 import { getProvider } from '../providers/index.js';
@@ -6,6 +9,16 @@ import { parseRange, contentRange, limitStream } from '../lib/range.js';
 import { mimeFromName, humanSize } from '../lib/mime.js';
 import { listZipEntries, openZipEntryStream, pickVideoEntry } from '../lib/zip.js';
 import { rewritePlaylist, listVariants, listSubtitles, splitUri, resolveUri, PLAYLIST_MIME } from '../lib/hls.js';
+import {
+  ffmpegAvailable,
+  probeMedia,
+  buildRenditions,
+  buildAudioOptions,
+  buildInputSpec,
+  buildMasterPlaylist,
+  getSession,
+  findSessionForSegment,
+} from '../services/transcode.js';
 
 export const streamRouter = Router();
 
@@ -125,9 +138,14 @@ streamRouter.get('/:sourceId', requireAuthOrJob, async (req, res) => {
   // A provider that dies mid-transfer emits an 'error' event. Without a
   // listener that is an unhandled error and takes the whole process down.
   const fail = (err) => {
-    console.error(`[stream] source ${source.id} failed:`, err?.message || err);
+    // The viewer seeking away or closing the tab aborts the request — that
+    // is normal and must not be reported as a failure.
+    const clientGone = res.writableEnded || res.destroyed || req.aborted;
+    if (!clientGone) {
+      console.error(`[stream] source ${source.id} failed:`, err?.message || err);
+    }
     if (!res.headersSent) res.status(502).end();
-    else res.destroy(err);
+    else res.destroy();
   };
   upstream.on('error', fail);
   out.on('error', fail);
@@ -264,6 +282,169 @@ streamRouter.get('/:sourceId/subtitle/:subtitleId', requireAuth, async (req, res
     console.error(`[stream] subtitle ${subtitle.id} failed:`, err.message);
     res.status(502).json({ error: 'Could not load the subtitle' });
   }
+});
+
+/**
+ * GET /api/stream/:sourceId/media-info
+ *
+ * Probes the source with ffprobe and reports what the player can offer:
+ * the real resolution, codecs, duration, the audio tracks, and the list of
+ * qualities the viewer can switch between.
+ */
+streamRouter.get('/:sourceId/media-info', requireAuth, async (req, res) => {
+  const source = one('SELECT * FROM sources WHERE id = ?', Number(req.params.sourceId));
+  if (!source) return res.status(404).json({ error: 'Source not found' });
+
+  if (!ffmpegAvailable()) {
+    return res.json({ available: false, renditions: [], audio: [], probe: null });
+  }
+
+  try {
+    const { spec, headers } = await buildInputSpec(source.id, source);
+    const probe = await probeMedia(spec, { headers });
+    if (!probe) {
+      return res.json({ available: false, renditions: [], audio: [], probe: null });
+    }
+    res.json({
+      available: true,
+      probe,
+      renditions: buildRenditions(probe),
+      audio: buildAudioOptions(probe),
+    });
+  } catch (err) {
+    console.error('[media-info] probe failed:', err.message);
+    res.json({ available: false, renditions: [], audio: [], probe: null });
+  }
+});
+
+/**
+ * GET /api/stream/:sourceId/master.m3u8
+ *
+ * The master playlist for a plain video file. Each entry is one quality,
+ * produced on demand by ffmpeg while the viewer watches.
+ */
+streamRouter.get('/:sourceId/master.m3u8', requireAuthOrJob, async (req, res) => {
+  const source = one('SELECT * FROM sources WHERE id = ?', Number(req.params.sourceId));
+  if (!source) return res.status(404).json({ error: 'Source not found' });
+
+  const audioKey = String(req.query.a || 'source');
+
+  // The browser reports the real resolution for free once the video has
+  // loaded, so the quality list can be built without probing. Probing a
+  // remote file can be slow, so it is only a fallback.
+  const known = readResolution(req.query);
+
+  try {
+    let renditions;
+    if (known) {
+      renditions = buildRenditions(null, known);
+    } else {
+      const { spec, headers } = await buildInputSpec(source.id, source);
+      const probe = await probeMedia(spec, { headers });
+      renditions = buildRenditions(probe);
+    }
+    res.setHeader('Content-Type', PLAYLIST_MIME);
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(buildMasterPlaylist(renditions, source.id, audioKey));
+  } catch (err) {
+    console.error('[transcode] master playlist failed:', err.message);
+    res.status(502).json({ error: 'Could not prepare the quality list' });
+  }
+});
+
+/**
+ * Read a resolution from the query string (`?w=1920&h=1080&c=h264`).
+ */
+function readResolution(query) {
+  const width = Number(query.w);
+  const height = Number(query.h);
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+    return null;
+  }
+  return { width, height, codec: query.c ? String(query.c) : 'h264' };
+}
+
+/**
+ * GET /api/stream/:sourceId/rendition.m3u8?q=720p&a=stereo
+ *
+ * One quality, as an HLS media playlist. The ffmpeg process is started on
+ * the first request and reused for the following segment requests.
+ */
+streamRouter.get('/:sourceId/rendition.m3u8', requireAuthOrJob, async (req, res) => {
+  const source = one('SELECT * FROM sources WHERE id = ?', Number(req.params.sourceId));
+  if (!source) return res.status(404).json({ error: 'Source not found' });
+
+  const quality = String(req.query.q || '720p');
+  const audioKey = String(req.query.a || 'source');
+  const known = readResolution(req.query);
+
+  try {
+    let rendition;
+    if (known) {
+      const list = buildRenditions(null, known);
+      rendition = list.find((r) => r.key === quality) || list[0];
+    } else {
+      const { spec, headers } = await buildInputSpec(source.id, source);
+      const probe = await probeMedia(spec, { headers });
+      const list = buildRenditions(probe);
+      rendition = list.find((r) => r.key === quality) || list[0];
+    }
+    if (!rendition) return res.status(400).json({ error: 'No such quality' });
+
+    const session = await getSession(source.id, source, rendition, audioKey);
+    if (!session.ready) {
+      return res.status(504).json({ error: 'The conversion did not start in time' });
+    }
+
+    const playlist = await fsp.readFile(session.playlist, 'utf8');
+    // ffmpeg writes plain file names ("seg00000.ts"). The browser would
+    // resolve them against the playlist URL, so they are rewritten to the
+    // segment route.
+    const rewritten = playlist.replace(
+      /^(?!#)(?!https?:)[^\r\n]+\.ts$/gm,
+      `/api/stream/${source.id}/transcode/$&`,
+    );
+
+    res.setHeader('Content-Type', PLAYLIST_MIME);
+    res.setHeader('Cache-Control', 'no-store');
+    res.send(rewritten);
+  } catch (err) {
+    console.error('[transcode] rendition failed:', err.message);
+    res.status(502).json({ error: 'Could not start the conversion' });
+  }
+});
+
+/**
+ * GET /api/stream/:sourceId/transcode/:file
+ * One HLS segment produced by the transcoder.
+ */
+streamRouter.get('/:sourceId/transcode/:file', requireAuthOrJob, async (req, res) => {
+  const file = path.basename(String(req.params.file));
+  if (!/^[\w.-]+\.(ts|m4s|mp4)$/i.test(file)) {
+    return res.status(400).json({ error: 'Invalid segment name' });
+  }
+
+  const source = one('SELECT * FROM sources WHERE id = ?', Number(req.params.sourceId));
+  if (!source) return res.status(404).json({ error: 'Source not found' });
+
+  // Find the session that produced this segment.
+  const session = findSessionForSegment(source.id, file);
+  if (!session) return res.status(404).json({ error: 'Segment not found' });
+
+  session.lastUsed = Date.now();
+  const abs = path.join(session.dir, file);
+  let stat;
+  try {
+    stat = await fsp.stat(abs);
+  } catch {
+    return res.status(404).json({ error: 'Segment not found' });
+  }
+
+  res.setHeader('Content-Type', 'video/mp2t');
+  res.setHeader('Content-Length', stat.size);
+  res.setHeader('Accept-Ranges', 'bytes');
+  res.setHeader('Cache-Control', 'private, max-age=3600');
+  fs.createReadStream(abs).pipe(res);
 });
 
 /**

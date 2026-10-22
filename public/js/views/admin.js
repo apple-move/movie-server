@@ -539,6 +539,15 @@ async function moviesPanel(panel) {
                 'button',
                 {
                   class: 'btn btn--soft btn--sm',
+                  title: 'Add a source from a URL (a video file, or a .zip whose contents can be picked)',
+                  onClick: () => showUrlForm(movie),
+                },
+                'URL',
+              ),
+              el(
+                'button',
+                {
+                  class: 'btn btn--soft btn--sm',
                   title: 'Convert the source to MP4 so browsers can play it',
                   onClick: () => showRemuxForm(movie),
                 },
@@ -596,6 +605,57 @@ async function moviesPanel(panel) {
   } catch (err) {
     container.append(el('p', { class: 'hint' }, err.message));
   }
+}
+
+/** Add a source from a URL. */
+async function showUrlForm(movie) {
+  const urlInput = el('input', {
+    type: 'url',
+    placeholder: 'https://example.com/movie.mp4  —  or  https://example.com/movie.zip',
+  });
+  const error = el('div', { class: 'alert alert--error', hidden: true });
+  const submit = el('button', { class: 'btn btn--accent btn--sm', type: 'submit' }, 'Add URL');
+
+  const form = el(
+    'form',
+    { style: { display: 'grid', gap: '10px' } },
+    error,
+    el('div', { class: 'field', style: { marginBottom: '0' } },
+      el('label', {}, 'Video or ZIP URL'),
+      urlInput),
+    el('div', { class: 'field__hint' },
+      'A direct video URL is streamed straight through. A .zip URL is browsable — pick the file inside it in the player.'),
+    submit,
+  );
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    error.hidden = true;
+    submit.disabled = true;
+    submit.textContent = 'Adding…';
+    try {
+      const res = await api.post(`/api/movies/${movie.id}/sources/url`, { url: urlInput.value.trim() });
+      toast(
+        res.source?.kind === 'zip'
+          ? 'Archive added — pick the file inside it in the player'
+          : 'URL added',
+        'ok',
+        5000,
+      );
+      form.remove();
+      renderAdmin(document.getElementById('view'));
+    } catch (err) {
+      error.textContent = err.message;
+      error.hidden = false;
+      submit.disabled = false;
+      submit.textContent = 'Add URL';
+    }
+  });
+
+  const host = document.getElementById('view');
+  host.append(form);
+  form.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  urlInput.focus();
 }
 
 /** Attach an existing storage file (or archive) to a movie. */
