@@ -118,6 +118,7 @@ DB_PATH=./data/movie-server.db
 LIBRARY_ROOT=./data/library
 DEBUG=false                                      # never on a public server
 JOB_TOKEN=some-long-random-string                # lets the ffmpeg worker read sources
+ALLOW_PRIVATE_URLS=false                         # allow URL imports from your LAN
 ```
 
 ### ☁️ Cloudflare R2 — *recommended*
