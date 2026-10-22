@@ -59,9 +59,11 @@ app.use((_req, res, next) => {
       // hls.js spawns a web worker for demuxing.
       "worker-src 'self' blob:",
       "child-src 'self' blob:",
-      "style-src 'self' 'unsafe-inline'",
+      // Google Fonts serves the stylesheet from fonts.googleapis.com and the
+      // woff2 files from fonts.gstatic.com — both must be allowed explicitly.
+      "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com",
       "connect-src 'self'",
-      "font-src 'self' data:",
+      "font-src 'self' data: https://fonts.gstatic.com",
       "frame-ancestors 'self'",
       "base-uri 'self'",
       "form-action 'self'",
