@@ -155,7 +155,10 @@ streamRouter.get('/:sourceId/download', requireAuth, async (req, res) => {
   try {
     stat = await provider.stat(source.remote_path);
   } catch (err) {
-    return res.status(502).json({ error: `Storage error: ${err.message}` });
+    // Provider errors can contain endpoint URLs and credential hints, so the
+    // detail is logged but never sent to the client.
+    console.error(`[download] stat failed for source ${source.id}:`, err.message);
+    return res.status(502).json({ error: 'Could not reach the storage provider' });
   }
   if (!stat) return res.status(404).json({ error: 'File missing from storage' });
 
@@ -182,6 +185,7 @@ streamRouter.get('/:sourceId/download', requireAuth, async (req, res) => {
       end: range?.end,
     });
   } catch (err) {
+    console.error(`[download] open failed for source ${source.id}:`, err.message);
     return res.status(502).json({ error: 'Could not open the file for download' });
   }
 
@@ -193,17 +197,23 @@ streamRouter.get('/:sourceId/download', requireAuth, async (req, res) => {
     res.setHeader('Content-Length', size);
   }
 
+  // If the provider ignored our Range and sent the full body, trim it here
+  // so the client always receives exactly the bytes it asked for.
+  const expected = range ? range.end - range.start + 1 : null;
+  const out = expected ? limitStream(upstream, expected) : upstream;
+
   const fail = (err) => {
     console.error(`[download] source ${source.id} failed:`, err?.message || err);
     if (!res.headersSent) res.status(502).end();
     else res.destroy(err);
   };
   upstream.on('error', fail);
+  out.on('error', fail);
   res.on('close', () => {
     if (upstream.destroy) upstream.destroy();
   });
 
-  upstream.pipe(res);
+  out.pipe(res);
 });
 
 /**
@@ -249,7 +259,10 @@ streamRouter.get('/:sourceId/subtitle/:subtitleId', requireAuth, async (req, res
     res.setHeader('Cache-Control', 'private, max-age=3600');
     res.send(text);
   } catch (err) {
-    res.status(502).json({ error: err.message });
+    // Provider errors can contain endpoint URLs and credential hints, so the
+    // detail is logged but never sent to the client.
+    console.error(`[stream] subtitle ${subtitle.id} failed:`, err.message);
+    res.status(502).json({ error: 'Could not load the subtitle' });
   }
 });
 
@@ -433,7 +446,11 @@ function collectPlaylistPaths(sourceId, playlistPath, text) {
     }
     if (/^[a-z][a-z0-9+.-]*:/i.test(uri)) continue; // absolute URL
     const resolved = resolveUri(uri, playlistPath);
-    if (resolved) set.add(resolved);
+    // The query string is dropped before the file is fetched, so the
+    // allowlist has to record the path only — otherwise a segment that is
+    // referenced as "seg.ts?token=abc" would never match the request for
+    // "seg.ts" and would be rejected as "not referenced by the playlist".
+    if (resolved) set.add(splitUri(resolved).path);
   }
   hlsAllowlist.set(sourceId, set);
   return set;
@@ -547,8 +564,13 @@ streamRouter.get('/:sourceId/hls', requireAuthOrJob, async (req, res) => {
       else res.destroy(err);
     };
     upstream.on('error', fail);
+    // If the provider ignored our Range and sent the full body, trim it here
+    // so the client always receives exactly the bytes it asked for.
+    const expected = parsed ? parsed.end - parsed.start + 1 : null;
+    const out = expected ? limitStream(upstream, expected) : upstream;
+    out.on('error', fail);
     res.on('close', () => upstream.destroy?.());
-    upstream.pipe(res);
+    out.pipe(res);
   } catch (err) {
     console.error('[hls] failed:', err.message);
     res.status(502).json({ error: 'Could not load the playlist segment' });

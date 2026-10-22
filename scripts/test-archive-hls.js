@@ -262,6 +262,45 @@ async function main() {
   check('HLS info reports variants', (hlsInfo.json?.variants?.length || 0) === 2, JSON.stringify(hlsInfo.json?.variants));
   check('HLS variant has a resolution', Boolean(hlsInfo.json?.variants?.[0]?.resolution));
 
+  /* --------------------------------------------- HLS with a query string -- */
+  section('3. HLS segments referenced with a query string');
+
+  // Real playlists often sign their segments ("seg.ts?token=…"). The query
+  // string is dropped before the file is fetched, so the allowlist must
+  // record the bare path — otherwise the segment is rejected as "not
+  // referenced by the playlist".
+  const queryPlaylist = [
+    '#EXTM3U',
+    '#EXT-X-TARGETDURATION:4',
+    '#EXTINF:4.0,',
+    'seg1.ts?token=abc123',
+    '#EXT-X-ENDLIST',
+    '',
+  ].join('\n');
+  const queryPath = path.join(hlsDir, 'query.m3u8');
+  fs.writeFileSync(queryPath, queryPlaylist);
+  const queryUp = await upload(token, queryPath, { provider: 'local', folder: 'HLS Tests' });
+  check('query-string playlist uploaded', queryUp.res.status === 201, JSON.stringify(queryUp.json));
+
+  const queryMovie = await req('POST', '/api/movies', {
+    token, body: { title: 'HLS Query Test', year: 2024, genres: ['Test'] },
+  });
+  const queryMovieId = queryMovie.json?.movie?.id;
+  const queryAttach = await req('POST', `/api/movies/${queryMovieId}/sources`, {
+    token, body: { provider: 'local', remotePath: queryUp.json.remotePath },
+  });
+  check('query-string playlist attached', queryAttach.res.status === 201, queryAttach.text);
+  const querySourceId = queryAttach.json?.source?.id;
+
+  const queryResp = await req('GET', `/api/stream/${querySourceId}/hls`, { token });
+  check('query-string playlist served', queryResp.res.status === 200, String(queryResp.res.status));
+  const querySegUri = queryResp.text.split('\n').find((l) => l && !l.startsWith('#'));
+  check('query-string segment URI rewritten', String(querySegUri).startsWith('/api/stream/'), querySegUri);
+
+  const querySeg = await req('GET', `${BASE}${querySegUri}`, { token, raw: true });
+  check('query-string segment is served', querySeg.res.status === 200, `${querySeg.res.status} ${querySeg.text?.slice(0, 80)}`);
+  check('query-string segment bytes match', querySeg.buf.equals(segmentA), String(querySeg.buf?.length));
+
   /* --------------------------------------------------- malformed zips --- */
   section('4. Malformed archives are handled safely');
 
@@ -416,6 +455,7 @@ async function main() {
   // Cleanup
   await req('DELETE', `/api/movies/${movieId}`, { token });
   await req('DELETE', `/api/movies/${hlsMovieId}`, { token });
+  await req('DELETE', `/api/movies/${queryMovieId}`, { token });
   fs.rmSync(tmpDir, { recursive: true, force: true });
 
   console.log(`\n${'='.repeat(44)}`);

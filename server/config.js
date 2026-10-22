@@ -58,6 +58,21 @@ const resolve = (p, fallback) => {
   return path.isAbsolute(v) ? v : path.resolve(ROOT, v);
 };
 
+/**
+ * Normalise TRUST_PROXY for Express.
+ *
+ * Express reads a NUMBER as "trust N hops" but a STRING as a list of trusted
+ * addresses or networks. `TRUST_PROXY=1` — the documented one-proxy setup —
+ * arrives as a string, so without this it would be parsed as the IP address
+ * 0.0.0.1 and X-Forwarded-For would be ignored completely: every client
+ * would look like the proxy, which breaks the IP ban list and makes the
+ * per-IP rate limit apply to everybody at once.
+ */
+const normalizeTrustProxy = (value) => {
+  const raw = str(value, 'loopback');
+  return /^\d+$/.test(raw) ? Number(raw) : raw;
+};
+
 export const config = {
   env: str(process.env.NODE_ENV, 'development'),
   // When enabled, error responses include the underlying detail. Never turn
@@ -70,7 +85,7 @@ export const config = {
   //   'loopback' (default) — only trust a proxy on the same machine
   //   '1'                   — trust one hop (the usual Nginx setup)
   //   'true'                — trust everything (ONLY behind a proxy you control)
-  trustProxy: str(process.env.TRUST_PROXY, 'loopback'),
+  trustProxy: normalizeTrustProxy(process.env.TRUST_PROXY),
   root: ROOT,
 
   jwtSecret: str(process.env.JWT_SECRET, 'insecure-dev-secret-change-me'),
@@ -154,9 +169,18 @@ for (const dir of [config.dataRoot, path.dirname(config.dbPath), config.libraryR
 
 // The job token lets the ffmpeg worker read sources through the streaming
 // route. Generate one when it is not configured.
-if (!config.jobToken) {
+//
+// A placeholder value is treated as "not set": the job token grants
+// unauthenticated read access to every source, so a publicly known value
+// (it ships in .env.example) must never be used as-is.
+const PLACEHOLDER_JOB_TOKENS = new Set([
+  'change-me-to-a-long-random-string',
+  'change-me-too-a-long-random-string',
+]);
+if (!config.jobToken || PLACEHOLDER_JOB_TOKENS.has(config.jobToken)) {
   config.jobToken = crypto.randomBytes(32).toString('hex');
-  console.log(
-    '[config] JOB_TOKEN was not set — generated a temporary one. Set JOB_TOKEN in .env to keep it stable across restarts.',
+  console.warn(
+    '[config] JOB_TOKEN was not set (or is still a placeholder) — generated a random one. ' +
+      'Set JOB_TOKEN in .env to keep it stable across restarts.',
   );
 }

@@ -100,6 +100,12 @@ export function createJob({
 
   const safeTarget = sanitizeTargetPath(targetPath);
 
+  // The duration is used to turn ffmpeg's progress into a percentage. The
+  // `sources` table has no duration of its own, so it comes from the movie's
+  // runtime (stored in minutes).
+  const movie = source.movie_id ? one('SELECT runtime FROM movies WHERE id = ?', source.movie_id) : null;
+  const durationSec = Number(movie?.runtime || 0) * 60;
+
   const id = crypto.randomUUID();
   run(
     `INSERT INTO jobs (id, type, status, user_id, source_id, movie_id, provider, target_path, progress, duration_sec, message)
@@ -112,8 +118,7 @@ export function createJob({
     source.movie_id,
     provider,
     safeTarget,
-    // The duration is used to turn ffmpeg's progress into a percentage.
-    Number(source.duration_sec || 0),
+    durationSec,
     'Queued',
   );
 
