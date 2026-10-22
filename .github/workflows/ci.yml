@@ -12,7 +12,7 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Checkout
@@ -27,6 +27,11 @@ jobs:
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Check ffmpeg
+        run: |
+          ffmpeg -version | head -1
+          ffprobe -version | head -1
 
       - name: Static checks
         run: |
@@ -58,8 +63,8 @@ jobs:
             import { DatabaseSync } from 'node:sqlite';
             const db = new DatabaseSync('./data/movie-server.db');
             const hash = bcrypt.hashSync('admin123', 12);
-            const existing = db.prepare(\"SELECT id FROM users WHERE username = 'admin'\").get();
-            if (existing) {
+            const found = db.prepare(\"SELECT id FROM users WHERE username = 'admin'\").get();
+            if (found) {
               db.prepare(\"UPDATE users SET password_hash = ?, role = 'admin' WHERE username = 'admin'\").run(hash);
             } else {
               db.prepare(\"INSERT INTO users (username, password_hash, role) VALUES ('admin', ?, 'admin')\").run(hash);
@@ -72,6 +77,7 @@ jobs:
         run: node scripts/test-api.js
 
       - name: Security tests
+        # Runs with the SSRF protection ON, so private addresses are refused.
         run: node scripts/test-security.js
 
       - name: TMDB tests
@@ -79,6 +85,41 @@ jobs:
 
       - name: Archive / HLS tests
         run: node scripts/test-archive-hls.js
+
+      - name: Quality control tests
+        run: node scripts/test-quality.js
+
+      # The URL-import suite talks to a local file server, so the server has
+      # to allow private addresses for this step.
+      - name: Restart the server with private URLs allowed
+        run: |
+          kill $(cat server.pid) 2>/dev/null || true
+          sleep 1
+          ALLOW_PRIVATE_URLS=true node server/index.js > server.log 2>&1 &
+          echo $! > server.pid
+          for i in $(seq 1 60); do
+            if curl -fsS http://127.0.0.1:3000/api/health > /dev/null; then
+              echo "server is up"
+              exit 0
+            fi
+            sleep 0.5
+          done
+          cat server.log
+          exit 1
+
+      - name: URL import tests
+        run: node scripts/test-url-import.js
+
+      - name: Install the browser
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright install chrome
+
+      - name: Browser UI tests
+        run: node scripts/test-ui.js
+
+      - name: Player option tests
+        run: node scripts/test-player-options.js
 
       - name: Stop the server
         if: always()
