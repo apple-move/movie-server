@@ -23,6 +23,7 @@ export const AUDIT_ACTIONS = {
   'movie.updated': 'Updated a movie',
   'movie.deleted': 'Deleted a movie',
   'source.attached': 'Attached a source',
+  'source.url_attached': 'Attached a source from a URL',
   'source.removed': 'Removed a source',
   'provider.created': 'Added a storage provider',
   'provider.updated': 'Updated a storage provider',

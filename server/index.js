@@ -12,6 +12,7 @@ import { bookmarksRouter } from './routes/bookmarks.js';
 import { optionalAuth } from './lib/auth.js';
 import { isBanned } from './lib/ip-ban.js';
 import { purgeExpiredSessions } from './lib/sessions.js';
+import { clearTranscodeCache, stopAllSessions } from './services/transcode.js';
 import { one } from './db.js';
 
 const app = express();
@@ -187,6 +188,12 @@ async function start() {
   await initProviders();
   sweepTempUploads();
 
+  // The transcode cache is disposable — it is rebuilt on demand — so a stale
+  // cache from a previous run is removed instead of filling the disk.
+  if (await clearTranscodeCache()) {
+    console.log('[cleanup] cleared the transcode cache');
+  }
+
   // Housekeeping: drop sessions that have expired.
   const purged = purgeExpiredSessions();
   if (purged) console.log(`[cleanup] removed ${purged} expired session(s)`);
@@ -204,6 +211,7 @@ async function start() {
 
   const shutdown = (signal) => {
     console.log(`\n[${signal}] shutting down...`);
+    stopAllSessions();
     server.close(() => process.exit(0));
     setTimeout(() => process.exit(1), 10_000).unref();
   };

@@ -15,23 +15,30 @@ import { getProvider } from '../providers/index.js';
  *
  *   GET /api/stream/:id/master.m3u8      -> the list of qualities
  *   GET /api/stream/:id/rendition.m3u8   -> one quality, as an HLS playlist
- *   GET /api/stream/:id/transcode/:file -> one HLS segment
+ *   GET /api/stream/:id/transcode/:sid/:file -> one HLS segment
  *
- * The result is cached per (source, quality, audio) and the ffmpeg process is
- * killed once the viewer stops watching.
+ * The result is cached per (source, file version, quality, audio) and the
+ * ffmpeg process is killed once the viewer stops watching.
  */
 
-/** How long a transcode session may sit idle before it is killed. */
-const SESSION_TTL = 5 * 60 * 1000;
+/** How long a session may sit completely idle before it is stopped. */
+const IDLE_TTL = 30 * 60 * 1000;
+
+/** The hard limit — a session never lives longer than this. */
+const MAX_LIFETIME = 6 * 60 * 60 * 1000;
 
 /** How long to wait for ffmpeg to produce the first playlist. */
 const START_TIMEOUT = 45_000;
 
-/** Running sessions, keyed by source + rendition + audio. */
-const sessions = new Map();
+/** How many ffmpeg processes may run at the same time. */
+const MAX_CONCURRENT = Number(process.env.MAX_CONCURRENT_TRANSCODE) || 3;
+
+/** How many transcode cache directories are kept on disk. */
+const MAX_CACHE_DIRS = Number(process.env.MAX_TRANSCODE_CACHE) || 8;
 
 /** Bitrate targets per rendition height. */
 const BITRATE_BY_HEIGHT = {
+  2160: 14_000_000,
   1080: 5_000_000,
   720: 2_800_000,
   480: 1_400_000,
@@ -44,8 +51,13 @@ const AUDIO_BITRATE = {
   high: '192k',
   stereo: '128k',
   low: '64k',
-  mute: null,
 };
+
+/** Running sessions, keyed by their cache key. */
+const sessions = new Map();
+
+/** Sessions that are still starting, so the same work is not done twice. */
+const pending = new Map();
 
 /** The URL ffmpeg should read from — always reachable from this machine. */
 export function internalUrl() {
@@ -61,7 +73,7 @@ export function ffmpegAvailable() {
 function findBinary(name) {
   const candidates =
     process.platform === 'win32'
-      ? [`${name}.exe`, `${name}`]
+      ? [`${name}.exe`, name]
       : [name, `/usr/bin/${name}`, `/usr/local/bin/${name}`];
   for (const candidate of candidates) {
     try {
@@ -82,6 +94,12 @@ function binaryPath(name) {
   return findBinary(name);
 }
 
+/* ------------------------------------------------------------- probing */
+
+/** Cached probe results, so a repeated request does not fork ffprobe again. */
+const probeCache = new Map();
+const PROBE_TTL = 10 * 60 * 1000;
+
 /**
  * Ask ffmpeg about a media file.
  *
@@ -90,7 +108,7 @@ function binaryPath(name) {
  *
  * @returns {Promise<object|null>}
  */
-export function probeMedia(inputSpec, { headers = null, maxBytes = 4 * 1024 * 1024 } = {}) {
+export async function probeMedia(inputSpec, { headers = null, maxBytes = 4 * 1024 * 1024 } = {}) {
   return new Promise((resolve) => {
     const ffprobe = binaryPath('ffprobe');
     if (!ffprobe) {
@@ -120,8 +138,7 @@ export function probeMedia(inputSpec, { headers = null, maxBytes = 4 * 1024 * 10
         }
         try {
           const parsed = parseProbe(JSON.parse(stdout));
-          // A probe that found no video stream is useless for the quality
-          // list — treat it as a failure.
+          // A probe that found no video stream is useless for the quality list.
           resolve(parsed.video ? parsed : null);
         } catch {
           resolve(null);
@@ -129,6 +146,22 @@ export function probeMedia(inputSpec, { headers = null, maxBytes = 4 * 1024 * 10
       },
     );
   });
+}
+
+/**
+ * Probe a source, reusing a recent result.
+ * The key includes the source id and its size, so a replaced file is probed
+ * again.
+ */
+export async function probeSource(sourceId, sourceRow, { maxBytes } = {}) {
+  const key = `${sourceId}:${sourceRow.size || 0}:${maxBytes || ''}`;
+  const cached = probeCache.get(key);
+  if (cached && Date.now() - cached.at < PROBE_TTL) return cached.value;
+
+  const { spec, headers } = await buildInputSpec(sourceId, sourceRow);
+  const value = await probeMedia(spec, { headers, maxBytes });
+  probeCache.set(key, { at: Date.now(), value });
+  return value;
 }
 
 function parseProbe(raw) {
@@ -172,12 +205,14 @@ function parseFps(value) {
   return Math.round((num / den) * 100) / 100;
 }
 
+/* ----------------------------------------------------------- renditions */
+
 /**
  * Work out which qualities can be offered for a source.
  *
- * `sourceResolution` is `{width, height}` when it is already known (the
- * browser reports it for free once the video has loaded). When it is not
- * known, the probe is used as a fallback.
+ * `sourceResolution` is `{width, height, codec}` when it is already known
+ * (the browser reports it for free once the video has loaded). When it is
+ * not known, the probe is used as a fallback.
  *
  * The original file is only offered as a "copy" rendition when the browser
  * can decode its codec — otherwise it is transcoded to a standard profile.
@@ -185,10 +220,9 @@ function parseFps(value) {
 export function buildRenditions(probe, sourceResolution = null) {
   const width = sourceResolution?.width || probe?.video?.width || 0;
   const height = sourceResolution?.height || probe?.video?.height || 0;
-  const codec = sourceResolution
-    ? (sourceResolution.codec || 'h264')
-    : (probe?.video?.codec || '');
+  const codec = sourceResolution?.codec || probe?.video?.codec || '';
   const browserCanCopy = /^(h264|avc1?)$/i.test(codec);
+  const sourceHeight = height || 1080;
 
   const list = [];
 
@@ -200,12 +234,13 @@ export function buildRenditions(probe, sourceResolution = null) {
       height,
       bandwidth: probe?.bitrate || 5_000_000,
       copy: true,
+      codecs: 'avc1.4d401f,mp4a.40.2',
     });
   }
 
-  for (const target of [1080, 720, 480, 360, 240]) {
+  for (const target of [2160, 1080, 720, 480, 360, 240]) {
     // Never upscale.
-    if (height && target >= height) continue;
+    if (height && target >= sourceHeight) continue;
     list.push({
       key: `${target}p`,
       label: `${target}p`,
@@ -213,19 +248,33 @@ export function buildRenditions(probe, sourceResolution = null) {
       height: target,
       bandwidth: BITRATE_BY_HEIGHT[target],
       copy: false,
+      // The codec string must have exactly six hex digits
+      // (profile, compatibility flags, level). A malformed string makes the
+      // browser drop the level, and the variant disappears from the playlist.
+      codecs: `avc1.4d401f,mp4a.40.2`,
     });
   }
 
   if (!list.length) {
-    // The source is smaller than 240p, or the codec cannot be copied —
-    // transcode to a fixed low quality so there is always something to play.
+    // The source is smaller than 240p, or the codec cannot be copied.
+    // "source" is still offered so the original file can be played as-is.
     list.push({
-      key: '360p',
-      label: '360p',
-      width: 640,
-      height: 360,
-      bandwidth: BITRATE_BY_HEIGHT[360],
+      key: 'source',
+      label: 'Original',
+      width: width || 640,
+      height: sourceHeight,
+      bandwidth: 5_000_000,
       copy: false,
+      codecs: 'avc1.4d401f,mp4a.40.2',
+    });
+    list.push({
+      key: '240p',
+      label: '240p',
+      width: 426,
+      height: 240,
+      bandwidth: BITRATE_BY_HEIGHT[240],
+      copy: false,
+      codecs: 'avc1.4d401f,mp4a.40.2',
     });
   }
 
@@ -245,6 +294,8 @@ export function buildAudioOptions(probe) {
   }
   return options;
 }
+
+/* --------------------------------------------------------------- input */
 
 /**
  * Build the input for ffmpeg.
@@ -268,6 +319,8 @@ export async function buildInputSpec(sourceId, sourceRow) {
   const headers = config.jobToken ? `X-Job-Token: ${config.jobToken}\r\n` : null;
   return { spec: url, headers };
 }
+
+/* ------------------------------------------------------------- session */
 
 /** The ffmpeg arguments for one rendition. */
 export function buildFfmpegArgs(rendition, audioKey, outDir) {
@@ -332,23 +385,44 @@ async function waitForPlaylist(session, timeout = START_TIMEOUT) {
 
 /**
  * Get (or start) the transcode session for a quality.
- * @returns {Promise<{dir, playlist, ready}>}
+ *
+ * @returns {Promise<{dir, playlist, ready, id}>}
  */
 export async function getSession(sourceId, sourceRow, rendition, audioKey) {
-  const key = `${sourceId}:${rendition.key}:${audioKey}`;
+  // The key includes the file size, so replacing the file behind a source
+  // does not reuse a stale transcode.
+  const key = `${sourceId}:${sourceRow.size || 0}:${rendition.key}:${audioKey}`;
 
+  // A session that is still starting is reused instead of starting a second
+  // ffmpeg for the same work.
+  if (pending.has(key)) return pending.get(key);
+
+  const promise = startSession(key, sourceId, sourceRow, rendition, audioKey)
+    .finally(() => pending.delete(key));
+  pending.set(key, promise);
+  return promise;
+}
+
+async function startSession(key, sourceId, sourceRow, rendition, audioKey) {
   const existing = sessions.get(key);
   if (existing) {
     existing.lastUsed = Date.now();
     if (existing.ready) return existing;
-    // Still starting up.
     const ok = await waitForPlaylist(existing);
     if (ok) return existing;
-    // It failed — start over.
     killSession(existing);
   }
 
-  const outDir = path.join(config.dataRoot, 'transcode', createHash('sha1').update(key).digest('hex').slice(0, 16));
+  // Do not start more than a few ffmpeg processes at a time.
+  while (sessions.size >= MAX_CONCURRENT) {
+    const oldest = [...sessions.values()].sort((a, b) => a.lastUsed - b.lastUsed)[0];
+    if (!oldest) break;
+    killSession(oldest);
+    await new Promise((r) => setTimeout(r, 50));
+  }
+
+  const id = createHash('sha1').update(key).digest('hex').slice(0, 16);
+  const outDir = path.join(config.dataRoot, 'transcode', id);
   await fsp.rm(outDir, { recursive: true, force: true }).catch(() => {});
   await fsp.mkdir(outDir, { recursive: true });
 
@@ -362,6 +436,7 @@ export async function getSession(sourceId, sourceRow, rendition, audioKey) {
 
   const session = {
     key,
+    id,
     sourceId,
     rendition,
     audioKey,
@@ -370,6 +445,7 @@ export async function getSession(sourceId, sourceRow, rendition, audioKey) {
     child,
     ready: false,
     lastUsed: Date.now(),
+    startedAt: Date.now(),
     log: '',
   };
   sessions.set(key, session);
@@ -401,13 +477,91 @@ export function killSession(session) {
   fsp.rm(session.dir, { recursive: true, force: true }).catch(() => {});
 }
 
-/** Kill sessions that have not been used for a while. */
+/**
+ * Find a session by its id.
+ */
+export function findSessionById(sourceId, sessionId) {
+  for (const session of sessions.values()) {
+    if (session.id === sessionId && session.sourceId === Number(sourceId)) return session;
+  }
+  return null;
+}
+
+/**
+ * Find the session that owns a generated segment file.
+ *
+ * The session id is part of the segment URL, so this is only a fallback.
+ */
+export function findSessionForSegment(sourceId, fileName) {
+  for (const session of sessions.values()) {
+    if (session.sourceId !== Number(sourceId)) continue;
+    if (fs.existsSync(path.join(session.dir, fileName))) return session;
+  }
+  return null;
+}
+
+/** Mark a session as still in use. */
+export function touchSession(session) {
+  if (session) session.lastUsed = Date.now();
+}
+
+/**
+ * Stop sessions that have not been used for a while, and keep the cache
+ * directory count under control.
+ */
 export function cleanupSessions() {
   const now = Date.now();
   for (const session of [...sessions.values()]) {
-    if (now - session.lastUsed > SESSION_TTL) {
-      killSession(session);
-    }
+    const idleTooLong = now - session.lastUsed > IDLE_TTL;
+    const livedTooLong = now - session.startedAt > MAX_LIFETIME;
+    if (idleTooLong || livedTooLong) killSession(session);
+  }
+  trimCacheDir();
+}
+
+/** Delete the oldest cache directories until only a few are left. */
+async function trimCacheDir() {
+  const root = path.join(config.dataRoot, 'transcode');
+  let entries;
+  try {
+    entries = await fsp.readdir(root, { withFileTypes: true });
+  } catch {
+    return;
+  }
+  const dirs = entries.filter((e) => e.isDirectory());
+  if (dirs.length <= MAX_CACHE_DIRS) return;
+
+  // Sort by modification time, oldest first.
+  const stats = await Promise.all(
+    dirs.map(async (d) => {
+      const full = path.join(root, d.name);
+      try {
+        const stat = await fsp.stat(full);
+        return { full, mtime: stat.mtimeMs };
+      } catch {
+        return { full, mtime: 0 };
+      }
+    }),
+  );
+  stats.sort((a, b) => a.mtime - b.mtime);
+  const remove = stats.slice(0, stats.length - MAX_CACHE_DIRS);
+  for (const { full } of remove) {
+    await fsp.rm(full, { recursive: true, force: true }).catch(() => {});
+  }
+}
+
+/**
+ * Delete every cached transcode. The cache is disposable — it is rebuilt on
+ * demand — so this is safe to do at startup.
+ */
+export async function clearTranscodeCache() {
+  const root = path.join(config.dataRoot, 'transcode');
+  try {
+    await fsp.rm(root, { recursive: true, force: true });
+    await fsp.mkdir(root, { recursive: true });
+    return true;
+  } catch {
+    return false;
   }
 }
 
@@ -416,31 +570,29 @@ export function stopAllSessions() {
   for (const session of [...sessions.values()]) killSession(session);
 }
 
-/**
- * Find the session that owns a generated segment file.
- */
-export function findSessionForSegment(sourceId, fileName) {
-  for (const session of sessions.values()) {
-    if (session.sourceId !== sourceId) continue;
-    if (fs.existsSync(path.join(session.dir, fileName))) return session;
-  }
-  return null;
-}
-
 // Periodic cleanup.
 const cleanupTimer = setInterval(cleanupSessions, 60_000);
 cleanupTimer.unref?.();
 
-/** The master playlist listing every quality. */
-export function buildMasterPlaylist(renditions, sourceId, audioKey) {
+/* ------------------------------------------------------------ playlists */
+
+/**
+ * The master playlist listing every quality.
+ */
+export function buildMasterPlaylist(renditions, sourceId, audioKey, query = '') {
   const lines = ['#EXTM3U', '#EXT-X-VERSION:3'];
   for (const rendition of renditions) {
     const bandwidth = Math.round(rendition.bandwidth || 1_000_000);
-    const codecs = rendition.copy ? 'avc1.4d401f,mp4a.40.2' : 'avc1.4d401f,mp4a.40.2';
+    const codecs = rendition.codecs || 'avc1.4d401f,mp4a.40.2';
+    const resolution = rendition.width && rendition.height
+      ? `,RESOLUTION=${rendition.width}x${rendition.height}`
+      : '';
+    const params = new URLSearchParams({ q: rendition.key, a: audioKey });
+    if (query) params.set('c', query);
     lines.push(
-      `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth},RESOLUTION=${rendition.width || 0}x${rendition.height || 0},CODECS="${codecs}",NAME="${rendition.label}"`,
+      `#EXT-X-STREAM-INF:BANDWIDTH=${bandwidth}${resolution},CODECS="${codecs}",NAME="${rendition.label}"`,
     );
-    lines.push(`/api/stream/${sourceId}/rendition.m3u8?q=${encodeURIComponent(rendition.key)}&a=${encodeURIComponent(audioKey)}`);
+    lines.push(`/api/stream/${sourceId}/rendition.m3u8?${params.toString()}`);
   }
   return `${lines.join('\n')}\n`;
 }

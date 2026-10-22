@@ -311,7 +311,15 @@ export function openModal(content, { onClose } = {}) {
   clear(root);
   root.append(content);
   root.hidden = false;
+  root.setAttribute('role', 'dialog');
+  root.setAttribute('aria-modal', 'true');
   root._onClose = onClose;
+  // Remember where the focus was, and move it into the dialog.
+  root._previousFocus = document.activeElement;
+  const focusable = root.querySelector(
+    'button, a[href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+  );
+  if (focusable) focusable.focus();
 }
 
 export function closeModal() {
@@ -319,9 +327,15 @@ export function closeModal() {
   if (!root || root.hidden) return;
   root.hidden = true;
   clear(root);
+  root.removeAttribute('role');
+  root.removeAttribute('aria-modal');
   const onClose = root._onClose;
   root._onClose = null;
-  if (typeof onClose === 'function') onClose();
+  // Put the focus back where it was.
+  if (root._previousFocus && document.contains(root._previousFocus)) {
+    root._previousFocus.focus();
+  }
+  root._previousFocus = null;
 }
 
 export function closePlayer() {

@@ -118,6 +118,8 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
   const page = el('div', { class: 'mp' });
   const video = el('video', { playsinline: '', preload: 'metadata' });
   video.className = 'mp__video';
+  video.setAttribute('aria-label', 'Video player');
+  video.setAttribute('tabindex', '-1');
 
   const stage = el('div', { class: 'mp__stage' }, video);
   page.append(stage);
@@ -159,11 +161,17 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     hoverPreview,
   );
 
-  /** An icon button with a tooltip. */
+  /** An icon button with a tooltip and an accessible name. */
   const btn = (name, title, onClick, extra = {}) =>
     el(
       'button',
-      { class: `mp__btn ${extra.className || ''}`, title, onClick },
+      {
+        class: `mp__btn ${extra.className || ''}`,
+        title,
+        'aria-label': title,
+        type: 'button',
+        onClick,
+      },
       icon(name, { size: extra.size || 19 }),
     );
 
@@ -444,19 +452,37 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
       return;
     }
 
+    // A specific level was chosen — hls.js is required, because only it can
+    // be told to play a particular variant. Native HLS playback (Safari)
+    // always uses the browser's own adaptive selection.
+    if (qualityKey !== 'auto' && qualityKey !== 'direct') {
+      if (typeof window.Hls === 'undefined') {
+        showOverlay('cast', 'Quality control unavailable',
+          'The HLS player library could not be loaded, so the quality selector is not available.', true);
+        return;
+      }
+      startHls();
+      return;
+    }
+
+    // "Auto" — native playback is fine where it exists.
     if (video.canPlayType('application/vnd.apple.mpegurl') !== '') {
-      // Safari handles HLS natively, including the quality levels.
       video.src = masterUrl();
       video.load();
       return;
     }
 
     if (typeof window.Hls === 'undefined') {
-      showOverlay('cast', 'Quality control unavailable',
-        'The HLS player library could not be loaded, so the quality selector is not available.', true);
+      showOverlay('cast', 'HLS not supported',
+        'This browser cannot play HLS streams and the player library could not be loaded.', true);
       return;
     }
 
+    startHls();
+  }
+
+  /** Attach hls.js and load the master playlist. */
+  function startHls() {
     hlsInstance = new window.Hls({
       enableWorker: true,
       lowLatencyMode: false,
@@ -520,6 +546,19 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     activeEntry = null;
     subtitles = allSubtitles.filter((s) => !s.source_id || s.source_id === source.id);
 
+    // Everything that belonged to the previous source is reset, otherwise the
+    // quality menu would offer the old source's qualities.
+    renditions = [];
+    mediaInfo = null;
+    hlsLevels = [];
+    qualityKey = 'direct';
+    qualityMode = 'direct';
+    audioKey = 'source';
+    currentQualityLabel = '';
+    sourceResolution.width = 0;
+    sourceResolution.height = 0;
+    sourceResolution.codec = '';
+
     try {
       info = await api.get(`/api/stream/${source.id}/info`);
     } catch {
@@ -534,6 +573,8 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     // The menus must follow the new source.
     buildMenus();
     closeMenus();
+    // The details of the new source are fetched in the background.
+    loadMediaInfo();
   }
 
   /* --------------------------------------------------------- playback */
@@ -752,6 +793,9 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     menuOpen = name;
     // Position-dependent labels are refreshed when the menu opens.
     refreshBookmarkLabel?.();
+    // Move the focus into the menu so the keyboard works right away.
+    const first = menu.querySelector('button');
+    if (first) first.focus();
   }
 
   function menuButton(label, value, onClick, active = false) {
@@ -772,7 +816,14 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     for (const old of page.querySelectorAll('.mp__menu')) old.remove();
     menuOpen = null;
 
-    const menu = (name) => el('div', { class: 'mp__menu', 'data-menu': name, hidden: true });
+    const menu = (name) =>
+      el('div', {
+        class: 'mp__menu',
+        'data-menu': name,
+        role: 'menu',
+        'aria-label': name,
+        hidden: true,
+      });
 
     /* ------------------------------------------------- sources & quality */
     const sourceMenu = menu('sources');
@@ -1106,7 +1157,7 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
           class: 'mp__menu-link',
           href: movie.trailer_url,
           target: '_blank',
-          rel: 'noopener',
+          rel: 'noopener noreferrer',
         }, icon('externalLink', { size: 14 }), 'Watch the trailer'),
       );
     }
@@ -1756,15 +1807,17 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
   video.addEventListener('loadedmetadata', () => {
     renderChapterMarks();
     loadChapters();
-    // The browser knows the real resolution for free — remember it so the
-    // quality list can be built without probing the file.
-    if (video.videoWidth && video.videoHeight) {
+    // The browser knows the real resolution for free — but only while the
+    // original file is playing. A converted rendition has a different size,
+    // and recording that would shrink the next source's quality list.
+    if (qualityMode === 'direct' && video.videoWidth && video.videoHeight) {
       const changed =
         sourceResolution.width !== video.videoWidth ||
         sourceResolution.height !== video.videoHeight;
       sourceResolution.width = video.videoWidth;
       sourceResolution.height = video.videoHeight;
-      if (changed && qualityMode === 'direct') {
+      if (!sourceResolution.codec) sourceResolution.codec = 'h264';
+      if (changed) {
         currentQualityLabel = `${video.videoHeight}p`;
         updateQualityBadge();
       }
@@ -1880,13 +1933,14 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
     return;
   }
 
-  // hls.js is only fetched when an HLS stream is actually played.
-  if (activeSource.kind === 'hls' && typeof window.Hls === 'undefined') {
+  // hls.js is loaded for every source, because a pinned quality needs it
+  // even when the file itself is a plain MP4.
+  if (typeof window.Hls === 'undefined') {
     await loadHlsLibrary().catch(() => {});
+  }
   if (myToken !== routeToken) {
     leave();
     return;
-  }
   }
 
   // Bookmarks have to be loaded BEFORE the menus are built, otherwise the
@@ -1936,14 +1990,15 @@ export async function openPlayer(movieId, params = new URLSearchParams()) {
 
   function leave() {
     releaseResources();
-    teardown = null;
+    // Only clear the global hook if it is still ours — a newer player may
+    // have registered its own teardown by now.
+    if (teardown === leave) teardown = null;
     // Remove THIS player's element only — closePlayer() would remove
     // whichever player happens to be open, which could be a newer one.
     page.remove();
     document.body.style.overflow = '';
     // The player is an overlay — the URL must not keep pointing at it, or a
-    // reload would re-open it. Only do this when the URL still points at
-    // THIS movie, so a newer navigation is never clobbered.
+    // reload would re-open it.
     const hashMovieId = Number((location.hash.match(/^#\/watch\/(\d+)/) || [])[1]);
     if (Number.isFinite(hashMovieId) && hashMovieId === movieId) {
       history.replaceState(null, '', `${location.pathname}${location.search}#/`);

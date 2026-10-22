@@ -3,6 +3,39 @@ import { safeFetch, validateUrl, fileNameFromUrl } from '../lib/safe-url.js';
 import { mimeFromName } from '../lib/mime.js';
 
 /**
+ * Pick the bytes `start..end` out of a stream.
+ *
+ * Used when the remote server ignores the Range header and answers with the
+ * whole file: the requested window has to be cut out here, otherwise the
+ * viewer receives the wrong part of the file (and more bytes than the
+ * Content-Length promises).
+ */
+function sliceBytes(source, start = 0, end) {
+  return Readable.from(
+    (async function* () {
+      let toSkip = start;
+      let remaining = Number.isFinite(end) ? end - start + 1 : Infinity;
+
+      for await (const chunk of source) {
+        if (remaining <= 0) break;
+
+        let buf = chunk;
+        if (toSkip > 0) {
+          const drop = Math.min(toSkip, buf.length);
+          toSkip -= drop;
+          buf = buf.subarray(drop);
+          if (!buf.length) continue;
+        }
+
+        if (buf.length > remaining) buf = buf.subarray(0, remaining);
+        remaining -= buf.length;
+        yield buf;
+      }
+    })(),
+  );
+}
+
+/**
  * A storage provider backed by a single remote URL.
  *
  * It implements the same interface as the other providers, so the ZIP
@@ -26,8 +59,16 @@ export function createUrlProvider(instance = {}) {
     if (cachedSize) return { size: cachedSize, mime: cachedMime };
     try {
       const response = await safeFetch(rawUrl, { method: 'HEAD' });
+      if (!response.ok && response.status !== 206) {
+        // A failure is not remembered — the admin may fix the URL and retry.
+        return { size: 0, mime: cachedMime };
+      }
       cachedSize = Number(response.headers.get('content-length') || 0);
-      cachedMime = response.headers.get('content-type') || '';
+      const type = response.headers.get('content-type') || '';
+      // Only trust a real media type; a captive portal's text/html is not.
+      if (type.startsWith('video/') || type.startsWith('audio/')) {
+        cachedMime = type;
+      }
     } catch (err) {
       console.error('[url] HEAD failed:', err.message);
     }
@@ -106,9 +147,15 @@ export function createUrlProvider(instance = {}) {
       }
       if (!response.body) throw new Error('The remote server sent no data');
 
-      // fetch() gives a web ReadableStream; the rest of the server works with
-      // Node streams, so convert it.
-      return Readable.fromWeb(response.body);
+      const stream = Readable.fromWeb(response.body);
+
+      // Some servers ignore the Range header and answer with the whole file.
+      // The bytes for the requested window then have to be picked out here —
+      // otherwise the viewer would get the wrong part of the file.
+      if (Number.isFinite(start) && response.status === 200) {
+        return sliceBytes(stream, start, end);
+      }
+      return stream;
     },
 
     async delete() {

@@ -133,6 +133,23 @@ async function main() {
     JSON.stringify(renditions.map((r) => r.height)));
   check('the audio options are offered', (info.json?.audio?.length || 0) >= 2, JSON.stringify(info.json?.audio));
 
+  // A malformed codec string makes the browser drop the variant, so the
+  // quality would silently disappear from the playlist.
+  const codecStrings = renditions.map((r) => r.codecs).filter(Boolean);
+  check('every rendition declares its codecs', codecStrings.length === renditions.length,
+    JSON.stringify(renditions.map((r) => r.codecs)));
+  check('the codec strings are well formed',
+    codecStrings.every((c) => c.split(',').every((part) => {
+      const value = part.trim().toLowerCase();
+      // avc1.PPCCLL — exactly six hex digits.
+      if (value.startsWith('avc1.')) return /^[0-9a-f]{6}$/.test(value.slice(5));
+      // mp4a.40.2 — the object type, then the audio object type.
+      if (value.startsWith('mp4a.')) return /^mp4a\.[0-9a-f]{2}\.[0-9]{1,2}$/.test(value);
+      // Anything else is accepted as long as it is not empty.
+      return Boolean(value);
+    })),
+    JSON.stringify(codecStrings));
+
   /* ------------------------------------------------------ master list */
   section('3. Master playlist');
   const master = await req('GET', `/api/stream/${sourceId}/master.m3u8`, { token });
@@ -145,6 +162,9 @@ async function main() {
   check('it lists every quality', variantCount === renditions.length, `${variantCount} vs ${renditions.length}`);
   check('the variants link back to the renditions',
     master.text.includes('/rendition.m3u8?q='), master.text.slice(0, 200));
+  check('every variant declares its codecs',
+    (master.text.match(/#EXT-X-STREAM-INF[^\n]*CODECS="[^"]+"/g) || []).length === variantCount,
+    master.text.slice(0, 400));
 
   /* --------------------------------------------------- real transcode */
   section('4. On-the-fly transcode');
@@ -159,11 +179,12 @@ async function main() {
 
   /* ------------------------------------------------------- the segment */
   section('5. Segment delivery');
-  const firstSegment = /seg\d+\.ts/.exec(rendition.text)?.[0];
-  check('a segment name was found', Boolean(firstSegment), rendition.text.slice(0, 160));
+  // The playlist points at the segment route, including the session id.
+  const segmentUrl = /\/api\/stream\/\d+\/transcode\/[^/\s]+\/seg\d+\.ts/.exec(rendition.text)?.[0];
+  check('a segment name was found', Boolean(segmentUrl), rendition.text.slice(0, 160));
 
-  if (firstSegment) {
-    const seg = await req('GET', `/api/stream/${sourceId}/transcode/${firstSegment}`, { token, raw: true });
+  if (segmentUrl) {
+    const seg = await req('GET', segmentUrl, { token, raw: true });
     check('the segment is served', seg.res.status === 200, String(seg.res.status));
     check('the segment has data', seg.buf.length > 1000, String(seg.buf.length));
     check('it has the right content type',
@@ -184,11 +205,16 @@ async function main() {
 
   /* --------------------------------------------------- path traversal */
   section('8. Segment path safety');
-  const evil = await req('GET', `/api/stream/${sourceId}/transcode/..%2F..%2Fmovie-server.db`, { token });
+  const evil = await req('GET', `/api/stream/${sourceId}/transcode/session/..%2F..%2Fmovie-server.db`, { token });
   check('a traversal attempt is rejected', evil.res.status === 400 || evil.res.status === 404, String(evil.res.status));
 
-  const badName = await req('GET', `/api/stream/${sourceId}/transcode/evil.sh`, { token });
-  check('a non-segment name is rejected', badName.res.status === 400, String(badName.res.status));
+  const badName = await req('GET', `/api/stream/${sourceId}/transcode/session/evil.sh`, { token });
+  check('a non-segment name is rejected', badName.res.status === 400 || badName.res.status === 404, String(badName.res.status));
+
+  // A segment that belongs to a different session must not be served.
+  const foreignSession = await req('GET', segmentUrl.replace(/\/transcode\/[^/]+\//, '/transcode/other-session/'), { token });
+  check('a segment from an unknown session is rejected',
+    foreignSession.res.status === 400 || foreignSession.res.status === 404, String(foreignSession.res.status));
 
   /* ----------------------------------------------------------- cleanup */
   await req('DELETE', `/api/movies/${movieId}`, { token });

@@ -11,6 +11,7 @@ import {
 import { humanSize, isVideoName, isSubtitleName, isArchiveName, isPlaylistName, mimeFromName } from '../lib/mime.js';
 import { listZipEntries, pickVideoEntry } from '../lib/zip.js';
 import { validateUrl, safeFetch, fileNameFromUrl } from '../lib/safe-url.js';
+import { audit } from '../lib/audit.js';
 
 export const moviesRouter = Router();
 
@@ -193,6 +194,7 @@ moviesRouter.post('/', requireAuth, requireAdmin, (req, res) => {
     imdb_id ?? null,
     featured ? 1 : 0,
   );
+  audit(req.user, 'movie.created', Number(res2.lastInsertRowid), { title }, req.ip);
   res.status(201).json({ movie: decorate(getMovie(Number(res2.lastInsertRowid))) });
 });
 
@@ -265,6 +267,7 @@ moviesRouter.patch('/:id', requireAuth, requireAdmin, (req, res) => {
     params.push(movie.id);
     run(`UPDATE movies SET ${fields.join(', ')} WHERE id = ?`, ...params);
   }
+  audit(req.user, 'movie.updated', movie.id, { fields: Object.keys(body) }, req.ip);
   res.json({ movie: decorate(getMovie(movie.id)) });
 });
 
@@ -273,6 +276,7 @@ moviesRouter.delete('/:id', requireAuth, requireAdmin, (req, res) => {
   const movie = getMovie(Number(req.params.id));
   if (!movie) return res.status(404).json({ error: 'Movie not found' });
   run('DELETE FROM movies WHERE id = ?', movie.id);
+  audit(req.user, 'movie.deleted', movie.id, { title: movie.title }, req.ip);
   res.json({ ok: true });
 });
 
@@ -407,17 +411,19 @@ moviesRouter.post('/:id/sources/url', requireAuth, requireAdmin, async (req, res
   // hash, so two different URLs never collide.
   const instanceId = `url_${createHash('sha256').update(validated.url.toString()).digest('hex').slice(0, 24)}`;
   const existing = getInstanceRow(instanceId);
+  const providerConfig = JSON.stringify({ url: validated.url.toString(), name: fileName });
+
   if (existing) {
     // Refresh the stored URL — it may have changed (or the id may be from an
     // earlier configuration).
     run(
       'UPDATE provider_instances SET config = ?, name = ? WHERE id = ?',
-      JSON.stringify({ url: validated.url.toString(), name: fileName }),
+      providerConfig,
       fileName,
       instanceId,
     );
     // The cached provider still holds the old URL.
-    reloadProviderInstance(instanceId);
+    await reloadProviderInstance(instanceId);
   } else {
     run(
       `INSERT INTO provider_instances (id, type, name, config, enabled, is_default)
@@ -425,7 +431,7 @@ moviesRouter.post('/:id/sources/url', requireAuth, requireAdmin, async (req, res
       instanceId,
       isArchive ? 'url-archive' : 'url',
       fileName,
-      JSON.stringify({ url: validated.url.toString(), name: fileName }),
+      providerConfig,
     );
   }
 
@@ -455,12 +461,15 @@ moviesRouter.post('/:id/sources/url', requireAuth, requireAdmin, async (req, res
       const entries = await listZipEntries(provider, validated.url.toString());
       const video = pickVideoEntry(entries);
       if (!video) {
+        // The instance would be left behind, so it is removed again.
+        if (!existing) run('DELETE FROM provider_instances WHERE id = ?', instanceId);
         return res.status(400).json({ error: 'That archive contains no playable video' });
       }
       size = video.size;
       mime = mimeFromName(video.name);
     } catch (err) {
       console.error('[movies] archive read failed:', err.message);
+      if (!existing) run('DELETE FROM provider_instances WHERE id = ?', instanceId);
       return res.status(400).json({ error: 'That archive could not be read' });
     }
   }
@@ -490,6 +499,13 @@ moviesRouter.post('/:id/sources/url', requireAuth, requireAdmin, async (req, res
     'SELECT * FROM sources WHERE provider = ? AND remote_path = ?',
     instanceId,
     validated.url.toString(),
+  );
+  audit(
+    req.user,
+    'source.url_attached',
+    source?.id,
+    { url: validated.url.toString(), kind },
+    req.ip,
   );
   res.status(201).json({ source });
 });
@@ -525,7 +541,10 @@ moviesRouter.get('/:id/archive', requireAuth, requireAdmin, async (req, res) => 
 
 /** DELETE /api/sources/:id */
 moviesRouter.delete('/sources/:id', requireAuth, requireAdmin, (req, res) => {
-  run('DELETE FROM sources WHERE id = ?', Number(req.params.id));
+  const id = Number(req.params.id);
+  const source = one('SELECT id, file_name FROM sources WHERE id = ?', id);
+  run('DELETE FROM sources WHERE id = ?', id);
+  audit(req.user, 'source.removed', id, { file: source?.file_name }, req.ip);
   res.json({ ok: true });
 });
 

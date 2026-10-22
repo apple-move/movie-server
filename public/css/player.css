@@ -234,7 +234,17 @@
 }
 .mp__menu-link:hover { background: rgba(255,255,255,.1); }
 
-.mp__row { display: flex; align-items: center; gap: 6px; }
+.mp__row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  /* On a narrow screen the row scrolls sideways instead of pushing the
+     buttons off the edge where they cannot be reached. */
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.mp__row::-webkit-scrollbar { display: none; }
+.mp__row > * { flex: none; }
 
 .mp__btn {
   background: none; border: none;

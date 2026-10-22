@@ -74,14 +74,17 @@ const files = {
 
 const fileServer = http.createServer((req, res) => {
   const name = new URL(req.url, 'http://x').pathname;
-  const body = files[name];
+  const key = name.startsWith('/norange/') ? name.slice('/norange'.length) : name;
+  const body = files[key];
   if (!body) {
     res.statusCode = 404;
     res.end('not found');
     return;
   }
   const range = req.headers.range;
-  if (range) {
+  // `/norange/clip.mp4` pretends not to understand Range, which is common
+  // for simple static hosts. The server has to cut the window out itself.
+  if (range && !name.startsWith('/norange/')) {
     const m = /bytes=(\d*)-(\d*)/.exec(range);
     const start = m && m[1] ? Number(m[1]) : 0;
     const end = m && m[2] ? Number(m[2]) : body.length - 1;
@@ -160,6 +163,27 @@ async function main() {
     check('the download is an attachment',
       (dl.res.headers.get('content-disposition') || '').startsWith('attachment'),
       dl.res.headers.get('content-disposition'));
+  }
+
+  /* ------------------------------- a server that ignores Range */
+  section('1b. A remote that ignores Range');
+
+  const noRangeAdd = await req('POST', `/api/movies/${movieId}/sources/url`, {
+    token, body: { url: `${fileBase}/norange/clip.mp4` },
+  });
+  check('the source is created', noRangeAdd.res.status === 201, `${noRangeAdd.res.status} ${noRangeAdd.text.slice(0, 150)}`);
+
+  const noRangeId = noRangeAdd.json?.source?.id;
+  if (noRangeId) {
+    const expected = files['/clip.mp4'];
+    const window = await req('GET', `/api/stream/${noRangeId}`, {
+      token, raw: true, headers: { range: 'bytes=100-199' },
+    });
+    check('the range request still answers 206', window.res.status === 206, String(window.res.status));
+    check('the window has the requested length', window.buf.length === 100, String(window.buf.length));
+    check('the window is the requested bytes',
+      window.buf.equals(expected.subarray(100, 200)),
+      'the server returned the wrong slice');
   }
 
   /* ------------------------------------------------------ a zip URL */

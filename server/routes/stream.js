@@ -12,12 +12,15 @@ import { rewritePlaylist, listVariants, listSubtitles, splitUri, resolveUri, PLA
 import {
   ffmpegAvailable,
   probeMedia,
+  probeSource,
   buildRenditions,
   buildAudioOptions,
   buildInputSpec,
   buildMasterPlaylist,
   getSession,
+  findSessionById,
   findSessionForSegment,
+  touchSession,
 } from '../services/transcode.js';
 
 export const streamRouter = Router();
@@ -300,8 +303,8 @@ streamRouter.get('/:sourceId/media-info', requireAuth, async (req, res) => {
   }
 
   try {
-    const { spec, headers } = await buildInputSpec(source.id, source);
-    const probe = await probeMedia(spec, { headers });
+    // The probe is cached, so a repeated request does not fork ffprobe again.
+    const probe = await probeSource(source.id, source);
     if (!probe) {
       return res.json({ available: false, renditions: [], audio: [], probe: null });
     }
@@ -339,13 +342,12 @@ streamRouter.get('/:sourceId/master.m3u8', requireAuthOrJob, async (req, res) =>
     if (known) {
       renditions = buildRenditions(null, known);
     } else {
-      const { spec, headers } = await buildInputSpec(source.id, source);
-      const probe = await probeMedia(spec, { headers });
+      const probe = await probeSource(source.id, source);
       renditions = buildRenditions(probe);
     }
     res.setHeader('Content-Type', PLAYLIST_MIME);
     res.setHeader('Cache-Control', 'no-store');
-    res.send(buildMasterPlaylist(renditions, source.id, audioKey));
+    res.send(buildMasterPlaylist(renditions, source.id, audioKey, known?.codec));
   } catch (err) {
     console.error('[transcode] master playlist failed:', err.message);
     res.status(502).json({ error: 'Could not prepare the quality list' });
@@ -382,12 +384,11 @@ streamRouter.get('/:sourceId/rendition.m3u8', requireAuthOrJob, async (req, res)
     let rendition;
     if (known) {
       const list = buildRenditions(null, known);
-      rendition = list.find((r) => r.key === quality) || list[0];
+      rendition = list.find((r) => r.key === quality) || list.find((r) => r.key === 'source') || list[0];
     } else {
-      const { spec, headers } = await buildInputSpec(source.id, source);
-      const probe = await probeMedia(spec, { headers });
+      const probe = await probeSource(source.id, source);
       const list = buildRenditions(probe);
-      rendition = list.find((r) => r.key === quality) || list[0];
+      rendition = list.find((r) => r.key === quality) || list.find((r) => r.key === 'source') || list[0];
     }
     if (!rendition) return res.status(400).json({ error: 'No such quality' });
 
@@ -399,10 +400,11 @@ streamRouter.get('/:sourceId/rendition.m3u8', requireAuthOrJob, async (req, res)
     const playlist = await fsp.readFile(session.playlist, 'utf8');
     // ffmpeg writes plain file names ("seg00000.ts"). The browser would
     // resolve them against the playlist URL, so they are rewritten to the
-    // segment route.
+    // segment route — with the session id, so a request can never be
+    // answered with a segment from a different rendition.
     const rewritten = playlist.replace(
       /^(?!#)(?!https?:)[^\r\n]+\.ts$/gm,
-      `/api/stream/${source.id}/transcode/$&`,
+      `/api/stream/${source.id}/transcode/${session.id}/$&`,
     );
 
     res.setHeader('Content-Type', PLAYLIST_MIME);
@@ -415,10 +417,13 @@ streamRouter.get('/:sourceId/rendition.m3u8', requireAuthOrJob, async (req, res)
 });
 
 /**
- * GET /api/stream/:sourceId/transcode/:file
+ * GET /api/stream/:sourceId/transcode/:sessionId/:file
  * One HLS segment produced by the transcoder.
+ *
+ * The session id is part of the URL, so a request can never be answered
+ * with a segment from a different rendition.
  */
-streamRouter.get('/:sourceId/transcode/:file', requireAuthOrJob, async (req, res) => {
+streamRouter.get('/:sourceId/transcode/:sessionId/:file', requireAuthOrJob, async (req, res) => {
   const file = path.basename(String(req.params.file));
   if (!/^[\w.-]+\.(ts|m4s|mp4)$/i.test(file)) {
     return res.status(400).json({ error: 'Invalid segment name' });
@@ -427,11 +432,10 @@ streamRouter.get('/:sourceId/transcode/:file', requireAuthOrJob, async (req, res
   const source = one('SELECT * FROM sources WHERE id = ?', Number(req.params.sourceId));
   if (!source) return res.status(404).json({ error: 'Source not found' });
 
-  // Find the session that produced this segment.
-  const session = findSessionForSegment(source.id, file);
+  const session = findSessionById(source.id, String(req.params.sessionId));
   if (!session) return res.status(404).json({ error: 'Segment not found' });
 
-  session.lastUsed = Date.now();
+  touchSession(session);
   const abs = path.join(session.dir, file);
   let stat;
   try {
@@ -441,9 +445,24 @@ streamRouter.get('/:sourceId/transcode/:file', requireAuthOrJob, async (req, res
   }
 
   res.setHeader('Content-Type', 'video/mp2t');
-  res.setHeader('Content-Length', stat.size);
   res.setHeader('Accept-Ranges', 'bytes');
   res.setHeader('Cache-Control', 'private, max-age=3600');
+
+  // Segments support range requests too.
+  const range = parseRange(req.headers.range, stat.size);
+  if (range?.invalid) {
+    res.setHeader('Content-Range', `bytes */${stat.size}`);
+    return res.status(416).end();
+  }
+  if (range) {
+    res.status(206);
+    res.setHeader('Content-Range', contentRange(range.start, range.end, stat.size));
+    res.setHeader('Content-Length', range.end - range.start + 1);
+    fs.createReadStream(abs, { start: range.start, end: range.end }).pipe(res);
+    return;
+  }
+
+  res.setHeader('Content-Length', stat.size);
   fs.createReadStream(abs).pipe(res);
 });
 

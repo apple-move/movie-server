@@ -8,6 +8,7 @@ import { requireAuth, requireAdmin } from '../lib/auth.js';
 import { getProvider } from '../providers/index.js';
 import { createLocalProvider } from '../providers/local.js';
 import { detectLanguage } from '../lib/subtitle.js';
+import { audit } from '../lib/audit.js';
 import { mimeFromName, humanSize } from '../lib/mime.js';
 
 export const uploadRouter = Router();
@@ -95,6 +96,11 @@ uploadRouter.post(
         sizeLabel: humanSize(result.size || req.file.size),
         source,
       });
+      audit(req.user, 'file.uploaded', result.path, {
+        provider: providerId,
+        size: result.size || req.file.size,
+        movieId: req.body?.movieId || null,
+      }, req.ip);
     } catch (err) {
       console.error('[upload] failed:', err);
       res.status(500).json({ error: err.message });
