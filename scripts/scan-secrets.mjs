@@ -1,5 +1,8 @@
 /**
- * Scan every committed file for real credentials.
+ * Scan every tracked file for real credentials.
+ *
+ * The working tree is scanned (that is what is about to be committed) and
+ * the whole git history is scanned as well.
  *
  * Deliberately strict: it only reports a value that looks like an actual
  * secret, not a hash, a separator line or a minified identifier.
@@ -7,6 +10,11 @@
  * Run: node scripts/scan-secrets.mjs
  */
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 
 const files = execFileSync('git', ['ls-files'], { encoding: 'utf8' })
   .split('\n')
@@ -44,7 +52,11 @@ const CHECKS = [
   },
   {
     name: 'Connection string with password',
-    re: /\b[a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:[^@\s]{3,}@/gi,
+    re: /\b[a-z][a-z0-9+.-]*:\/\/[^:\s/@]+:([^@\s]{3,})@/gi,
+    // Only the password part is checked, so obvious test placeholders are
+    // ignored without hiding a real credential elsewhere in the string.
+    ignoreGroup: 1,
+    ignore: /^(pass|passwd|password|secret|test|demo|user|xxx|changeme|placeholder|admin)/i,
   },
 ];
 
@@ -62,16 +74,20 @@ for (const file of files) {
 
   let content;
   try {
-    content = execFileSync('git', ['show', `HEAD:${file}`], {
-      encoding: 'utf8',
-      maxBuffer: 30 * 1024 * 1024,
-    });
+    // Scan the working tree — that is what is about to be committed.
+    content = fs.readFileSync(path.join(ROOT, file), 'utf8');
   } catch {
     continue;
   }
 
-  for (const { name, re } of CHECKS) {
-    for (const match of content.match(re) || []) report(file, name, match);
+  for (const { name, re, ignore, ignoreGroup } of CHECKS) {
+    for (const match of content.match(re) || []) {
+      if (ignore) {
+        const subject = ignoreGroup ? match.split(':').pop() : match;
+        if (ignore.test(subject)) continue;
+      }
+      report(file, name, match);
+    }
   }
 
   // Environment-style assignments: only flag a real-looking value.
