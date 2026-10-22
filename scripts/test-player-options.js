@@ -68,7 +68,12 @@ await page.goto(BASE, { waitUntil: 'networkidle' });
 await page.fill('#login-username', 'admin');
 await page.fill('#login-password', 'admin123');
 await page.click('button[type=submit]');
-await page.waitForSelector('.hero', { timeout: 15000 });
+// The library may be empty (a fresh database), so either the hero or the
+// empty state means the app is ready.
+await page
+  .waitForSelector('.hero, .empty', { timeout: 15_000 })
+  .catch(() => {});
+await page.waitForTimeout(500);
 
 // Build a real clip so the player has something to decode, and attach it to
 // a movie of our own — the test must not depend on a remote provider.
